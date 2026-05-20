@@ -1,0 +1,271 @@
+{
+  "island": "Bermuda",
+  "island_key": "bermuda",
+  "generated": "2026-05-17T12:42:04+00:00",
+  "buoy": {
+    "source": "1 buoy",
+    "avg_height_m": 1.3,
+    "avg_period_s": 9.0,
+    "avg_dir_deg": 122.0
+  },
+  "days": [
+    {
+      "date": "2026-05-17",
+      "label": "Today",
+      "spots": {
+        "south_shore": {
+          "quality": "POOR",
+          "score_overall": 0.322,
+          "avg_height_m": 0.84,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "Southlands",
+          "shore": "south",
+          "break_type": "reef",
+          "peak": {
+            "time": "03:00",
+            "score": 0.474,
+            "quality": "POOR",
+            "swell_height_m": 0.84,
+            "swell_period_s": 7.2,
+            "swell_dir": "SE",
+            "swell_dir_deg": 139,
+            "wind_speed_mph": 2.6,
+            "wind_dir": "NE",
+            "wind_dir_deg": 54,
+            "wind_gusts_mph": 4.9,
+            "is_wrap": false,
+            "in_shadow": false,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        },
+        "north_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.183,
+          "avg_height_m": 0.06,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "North Rock",
+          "shore": "north",
+          "break_type": "reef",
+          "peak": {
+            "time": "23:00",
+            "score": 0.454,
+            "quality": "POOR",
+            "swell_height_m": 0.67,
+            "swell_period_s": 6.15,
+            "swell_dir": "NW",
+            "swell_dir_deg": 317,
+            "wind_speed_mph": 2.7,
+            "wind_dir": "E",
+            "wind_dir_deg": 88,
+            "wind_gusts_mph": 5.8,
+            "is_wrap": false,
+            "in_shadow": false,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        }
+      }
+    },
+    {
+      "date": "2026-05-18",
+      "label": "Tomorrow",
+      "spots": {
+        "south_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.234,
+          "avg_height_m": 0.81,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "Southlands",
+          "shore": "south",
+          "break_type": "reef",
+          "peak": {
+            "time": "03:00",
+            "score": 0.333,
+            "quality": "POOR",
+            "swell_height_m": 0.84,
+            "swell_period_s": 7.35,
+            "swell_dir": "SE",
+            "swell_dir_deg": 132,
+            "wind_speed_mph": 6.9,
+            "wind_dir": "NE",
+            "wind_dir_deg": 56,
+            "wind_gusts_mph": 9.6,
+            "is_wrap": false,
+            "in_shadow": false,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        },
+        "north_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.145,
+          "avg_height_m": 0.03,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "North Rock",
+          "shore": "north",
+          "break_type": "reef",
+          "peak": {
+            "time": "00:00",
+            "score": 0.171,
+            "quality": "FLAT/BLOWN",
+            "swell_height_m": 0.03,
+            "swell_period_s": 7.35,
+            "swell_dir": "SE",
+            "swell_dir_deg": 133,
+            "wind_speed_mph": 5.0,
+            "wind_dir": "E",
+            "wind_dir_deg": 94,
+            "wind_gusts_mph": 8.7,
+            "is_wrap": false,
+            "in_shadow": true,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        }
+      }
+    },
+    {
+      "date": "2026-05-19",
+      "label": "Tuesday",
+      "spots": {
+        "south_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.184,
+          "avg_height_m": 0.79,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "Southlands",
+          "shore": "south",
+          "break_type": "reef",
+          "peak": {
+            "time": "22:00",
+            "score": 0.201,
+            "quality": "FLAT/BLOWN",
+            "swell_height_m": 0.8,
+            "swell_period_s": 7.0,
+            "swell_dir": "SE",
+            "swell_dir_deg": 129,
+            "wind_speed_mph": 7.0,
+            "wind_dir": "SE",
+            "wind_dir_deg": 136,
+            "wind_gusts_mph": 11.4,
+            "is_wrap": false,
+            "in_shadow": false,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        },
+        "north_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.153,
+          "avg_height_m": 0.03,
+          "confidence": 0.9,
+          "confidence_label": "HIGH",
+          "spot_name": "North Rock",
+          "shore": "north",
+          "break_type": "reef",
+          "peak": {
+            "time": "22:00",
+            "score": 0.273,
+            "quality": "FLAT/BLOWN",
+            "swell_height_m": 0.03,
+            "swell_period_s": 7.0,
+            "swell_dir": "SE",
+            "swell_dir_deg": 129,
+            "wind_speed_mph": 7.0,
+            "wind_dir": "SE",
+            "wind_dir_deg": 136,
+            "wind_gusts_mph": 11.4,
+            "is_wrap": false,
+            "in_shadow": true,
+            "confidence": 0.9
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict"
+          ]
+        }
+      }
+    },
+    {
+      "date": "2026-05-20",
+      "label": "Wednesday",
+      "spots": {
+        "south_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.201,
+          "avg_height_m": 0.76,
+          "confidence": 0.89,
+          "confidence_label": "HIGH",
+          "spot_name": "Southlands",
+          "shore": "south",
+          "break_type": "reef",
+          "peak": {
+            "time": "18:00",
+            "score": 0.215,
+            "quality": "FLAT/BLOWN",
+            "swell_height_m": 0.72,
+            "swell_period_s": 7.0,
+            "swell_dir": "SE",
+            "swell_dir_deg": 126,
+            "wind_speed_mph": 3.1,
+            "wind_dir": "SSW",
+            "wind_dir_deg": 204,
+            "wind_gusts_mph": 8.9,
+            "is_wrap": false,
+            "in_shadow": false,
+            "confidence": 0.88
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict",
+            "3d forecast \u2014 directional guidance only"
+          ]
+        },
+        "north_shore": {
+          "quality": "FLAT/BLOWN",
+          "score_overall": 0.237,
+          "avg_height_m": 0.03,
+          "confidence": 0.89,
+          "confidence_label": "HIGH",
+          "spot_name": "North Rock",
+          "shore": "north",
+          "break_type": "reef",
+          "peak": {
+            "time": "18:00",
+            "score": 0.294,
+            "quality": "FLAT/BLOWN",
+            "swell_height_m": 0.03,
+            "swell_period_s": 7.0,
+            "swell_dir": "SE",
+            "swell_dir_deg": 126,
+            "wind_speed_mph": 3.1,
+            "wind_dir": "SSW",
+            "wind_dir_deg": 204,
+            "wind_gusts_mph": 8.9,
+            "is_wrap": false,
+            "in_shadow": true,
+            "confidence": 0.88
+          },
+          "flags": [
+            "wind swell \u2014 messy and harder to predict",
+            "3d forecast \u2014 directional guidance only"
+          ]
+        }
+      }
+    }
+  ]
+}
