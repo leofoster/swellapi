@@ -121,28 +121,39 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
 
 def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "auto") -> Optional[list]:
     try:
-        marine = requests.get(
+        marine_resp = requests.get(
             "https://marine-api.open-meteo.com/v1/marine",
             params={
                 "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "hourly": [
-                    "wave_height", "wave_direction", "wave_period", "swell_wave_height", 
+                    "wave_height", "wave_direction", "wave_period", "swell_wave_height",
                     "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
                     "wind_wave_height", "wind_wave_period",
                 ],
             }, timeout=10
-        ).json()
+        )
+        marine = marine_resp.json()
 
-        weather = requests.get(
+        weather_resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
-                "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days, 
+                "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "wind_speed_unit": "mph",
                 "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"],
             }, timeout=10
-        ).json()
+        )
+        weather = weather_resp.json()
     except Exception as e:
-        print(f"  ❌ Open-Meteo error: {e}")
+        print(f"  ❌ Open-Meteo request failed: {e}")
+        return None
+
+    # NEW: check for API-level errors before indexing into the response
+    if marine.get("error") or "hourly" not in marine:
+        print(f"  ❌ Marine API error for ({lat}, {lon}): {marine.get('reason', 'no hourly data — likely no marine model coverage at this location')}")
+        return None
+
+    if weather.get("error") or "hourly" not in weather:
+        print(f"  ❌ Weather API error for ({lat}, {lon}): {weather.get('reason', 'unknown error')}")
         return None
 
     mh, wh = marine["hourly"], weather["hourly"]
@@ -159,7 +170,6 @@ def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "aut
         "wind_direction_deg":  wh["wind_direction_10m"][i],
         "wind_gusts_mph":      wh["wind_gusts_10m"][i],
     } for i in range(len(mh["time"]))]
-
 
 def fetch_mock_tides(lat: float, lon: float, days: int, now: datetime) -> dict:
     """
