@@ -122,8 +122,8 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
 def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "auto") -> Optional[list]:
     try:
         marine_resp = requests.get(
-           # "https://marine-api.open-meteo.com/v1/marine",
-           "https://stubble-number-federal.ngrok-free.dev/marine",
+           "https://marine-api.open-meteo.com/v1/marine",
+          # "https://stubble-number-federal.ngrok-free.dev/marine",
             params={
                 "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "hourly": [
@@ -136,8 +136,8 @@ def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "aut
         marine = marine_resp.json()
 
         weather_resp = requests.get(
-            #"https://api.open-meteo.com/v1/forecast",
-            "https://stubble-number-federal.ngrok-free.dev/forecast",
+            "https://api.open-meteo.com/v1/forecast",
+           # "https://stubble-number-federal.ngrok-free.dev/forecast",
             params={
                 "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "wind_speed_unit": "mph",
