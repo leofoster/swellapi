@@ -262,6 +262,98 @@ def get_island_forecast(island_key: str, days: int = 3):
     )
     return post_forecast(req)
 
+# ─────────────────────────────────────────────────────────────────
+#  ESP32 ENDPOINT — 3-hour blocks, short keys, minimal payload
+# ─────────────────────────────────────────────────────────────────
+
+# Mirrors the label_map thresholds in surfdeck.infer_spot().
+ESP_LABELS = [(0.85, "PUMPING"), (0.70, "GOOD"), (0.50, "FAIR"), (0.30, "POOR"), (0.00, "FLAT")]
+
+def _label_for(score: float) -> str:
+    return next(lbl for thresh, lbl in ESP_LABELS if score >= thresh)
+
+def _circular_mean(degrees: list[float]) -> Optional[float]:
+    """Mean of compass bearings. A plain average of 350 and 10 gives 180, not 0."""
+    import math
+    vals = [d for d in degrees if d is not None]
+    if not vals: return None
+    x = safe_mean([math.cos(math.radians(d)) for d in vals])
+    y = safe_mean([math.sin(math.radians(d)) for d in vals])
+    if x is None or y is None: return None
+    return round(math.degrees(math.atan2(y, x)) % 360, 1)
+
+class EspBlock(BaseModel):
+    t:  str                      # block label, e.g. "Mon 15"
+    hn: int                      # hours from now at block start
+    h:  Optional[float]          # swell height m (mean)
+    p:  Optional[float]          # swell period s (mean)
+    sd: str                      # swell direction compass
+    sg: Optional[float]          # swell direction deg
+    w:  Optional[float]          # wind speed mph (mean)
+    wd: str                      # wind direction compass
+    wg: Optional[float]          # wind direction deg
+    r:  float                    # rating 0.0-1.0
+    q:  str                      # rating label
+
+class EspResponse(BaseModel):
+    s:  str                      # spot name
+    g:  str                      # generated (UTC iso, seconds)
+    b:  list[EspBlock]           # blocks, soonest first
+
+@app.get("/esp/{island_key}", response_model=EspResponse)
+def get_esp_forecast(island_key: str, blocks: int = Query(8, ge=1, le=16)):
+    """Compact 3-hour-averaged forecast sized for a microcontroller display."""
+    # +1 day of slack: Open-Meteo hours start at local midnight, so the past
+    # hours we discard below would otherwise eat into the requested blocks.
+    hours_needed = blocks * 3
+    days = min(max(1, -(-hours_needed // 24)) + 1, 5)       # ceil, capped
+    full = get_island_forecast(island_key, days=days)
+
+    now       = datetime.now(timezone.utc)
+    this_hour = now.replace(minute=0, second=0, microsecond=0)
+
+    readings = sorted(
+        (h for d in full.days for h in d.hours
+         if datetime.fromisoformat(h.time) >= this_hour),
+        key=lambda h: h.time,
+    )
+    if not readings:
+        raise HTTPException(status_code=502, detail="No hourly data available")
+
+    out: list[EspBlock] = []
+    for i in range(0, len(readings), 3):
+        if len(out) >= blocks: break
+        chunk = readings[i:i + 3]
+        start = datetime.fromisoformat(chunk[0].time)
+        hn    = max(0, int((start - now).total_seconds() // 3600))
+
+        score = round(safe_mean([h.score_overall for h in chunk]) or 0.0, 3)
+        swell_deg = _circular_mean([h.swell_direction_deg for h in chunk])
+        wind_deg  = _circular_mean([h.wind_direction_deg for h in chunk])
+        height    = safe_mean([h.effective_height_m for h in chunk])
+        period    = safe_mean([h.swell_period_s for h in chunk if h.swell_period_s is not None])
+        wind      = safe_mean([h.wind_speed_mph for h in chunk if h.wind_speed_mph is not None])
+
+        out.append(EspBlock(
+            t  = start.strftime("%a %H"),
+            hn = hn,
+            h  = round(height, 2) if height is not None else None,
+            p  = round(period, 1) if period is not None else None,
+            sd = deg_to_compass(swell_deg),
+            sg = swell_deg,
+            w  = round(wind, 1) if wind is not None else None,
+            wd = deg_to_compass(wind_deg),
+            wg = wind_deg,
+            r  = score,
+            q  = _label_for(score),
+        ))
+
+    return EspResponse(
+        s = full.spot_name,
+        g = datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        b = out,
+    )
+
 @app.get("/islands")
 def list_islands(): return {"islands": {k: {"name": i.name, "spots": list(s.keys()), "lat": i.offshore_lat, "lon": i.offshore_lon} for k, (i, s) in ISLANDS.items()}}
 
