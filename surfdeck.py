@@ -33,9 +33,15 @@ OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
 MARINE_URL  = f"{OPEN_METEO_PROXY}/marine"   if OPEN_METEO_PROXY else "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = f"{OPEN_METEO_PROXY}/forecast" if OPEN_METEO_PROXY else "https://api.open-meteo.com/v1/forecast"
 
-# Shared secret for the proxy, so a public tunnel is not an open relay.
-_PROXY_TOKEN   = os.environ.get("PROXY_TOKEN", "")
-_PROXY_HEADERS = {"X-Proxy-Token": _PROXY_TOKEN} if (OPEN_METEO_PROXY and _PROXY_TOKEN) else {}
+_PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
+_PROXY_HEADERS: dict[str, str] = {}
+if OPEN_METEO_PROXY:
+    # Shared secret, so a public tunnel is not an open relay.
+    if _PROXY_TOKEN:
+        _PROXY_HEADERS["X-Proxy-Token"] = _PROXY_TOKEN
+    # ngrok's free tier can answer with an HTML interstitial instead of the
+    # JSON body, which would fail to parse. This header opts out of it.
+    _PROXY_HEADERS["ngrok-skip-browser-warning"] = "true"
 
 
 def safe_mean(values: list) -> Optional[float]:
