@@ -121,25 +121,60 @@ static bool ensureWifi() {
 static bool pollForecast() {
   if (!ensureWifi()) return false;
 
+  // Tolerate API_HOST being pasted with a scheme and/or trailing slash —
+  // "https://host/" would otherwise build "https://https://host//esp/..."
+  char host[96];
+  const char *h = API_HOST;
+  if (strncmp(h, "https://", 8) == 0)     h += 8;
+  else if (strncmp(h, "http://", 7) == 0) h += 7;
+  copyStr(host, sizeof(host), h);
+  char *slash = strchr(host, '/');
+  if (slash) *slash = '\0';
+
   char url[160];
   snprintf(url, sizeof(url), "https://%s/esp/%s?blocks=%d",
-           API_HOST, ISLAND_KEY, NUM_BLOCKS);
+           host, ISLAND_KEY, NUM_BLOCKS);
+  Serial.printf("GET %s\n", url);
+
+  // Stage 1: DNS. A wrong or unset API_HOST dies here, and HTTPClient would
+  // only ever report it as a generic -1.
+  IPAddress ip;
+  if (!WiFi.hostByName(host, ip)) {
+    copyStr(lastError, sizeof(lastError), "DNS fail: bad host?");
+    Serial.printf("cannot resolve %s\n", host);
+    return false;
+  }
+  Serial.printf("%s -> %s\n", host, ip.toString().c_str());
 
   WiFiClientSecure client;
   client.setInsecure();          // no cert pinning; public forecast data only
-  client.setTimeout(45);         // seconds — Render free tier cold-starts slowly
+
+  // Stage 2: TCP + TLS handshake. Separated so a blocked port or a heap
+  // shortage during the handshake is distinguishable from an HTTP error.
+  if (!client.connect(ip, 443, 20000)) {
+    snprintf(lastError, sizeof(lastError), "TLS fail heap %u",
+             (unsigned)ESP.getFreeHeap());
+    Serial.printf("connect to %s:443 failed, free heap %u\n",
+                  host, (unsigned)ESP.getFreeHeap());
+    return false;
+  }
+  Serial.println("TLS ok");
 
   HTTPClient http;
-  http.setTimeout(45000);
+  http.setConnectTimeout(20000);
+  http.setTimeout(60000);        // Render free tier cold-starts can take ~60s
   http.setReuse(false);
   if (!http.begin(client, url)) {
     copyStr(lastError, sizeof(lastError), "http begin fail");
+    client.stop();
     return false;
   }
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     snprintf(lastError, sizeof(lastError), "HTTP %d", code);
+    Serial.printf("GET failed: %d %s\n", code,
+                  HTTPClient::errorToString(code).c_str());
     http.end();
     return false;
   }
