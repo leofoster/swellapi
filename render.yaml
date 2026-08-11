@@ -5,3 +5,12 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     plan: free
+    envVars:
+      # Open-Meteo's free tier rejects Render's shared datacenter IPs, so
+      # upstream calls are routed through api_prox.py on a home connection.
+      # Set both in the Render dashboard; sync:false keeps them out of git.
+      # Unset OPEN_METEO_PROXY to go back to calling Open-Meteo directly.
+      - key: OPEN_METEO_PROXY
+        sync: false
+      - key: PROXY_TOKEN
+        sync: false

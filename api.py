@@ -357,5 +357,38 @@ def get_esp_forecast(island_key: str, blocks: int = Query(8, ge=1, le=16)):
 @app.get("/islands")
 def list_islands(): return {"islands": {k: {"name": i.name, "spots": list(s.keys()), "lat": i.offshore_lat, "lon": i.offshore_lon} for k, (i, s) in ISLANDS.items()}}
 
+@app.get("/debug/upstream")
+def debug_upstream(lat: float = 32.30, lon: float = -64.80):
+    """Report what Open-Meteo actually says, as seen from the server.
+
+    fetch_open_meteo() swallows upstream failures into a bare 502, which is
+    invisible once deployed. This exposes the real status and reason.
+    """
+    import requests
+    out = {}
+    targets = {
+        "marine":  ("https://marine-api.open-meteo.com/v1/marine",
+                    {"hourly": "swell_wave_height"}),
+        "weather": ("https://api.open-meteo.com/v1/forecast",
+                    {"hourly": "wind_speed_10m"}),
+    }
+    for name, (url, extra) in targets.items():
+        try:
+            r = requests.get(url, params={"latitude": lat, "longitude": lon,
+                                          "forecast_days": 1, **extra}, timeout=10)
+            body = {}
+            try: body = r.json()
+            except Exception: pass
+            out[name] = {
+                "status":     r.status_code,
+                "error":      body.get("error"),
+                "reason":     body.get("reason"),
+                "has_hourly": "hourly" in body,
+                "snippet":    r.text[:200],
+            }
+        except Exception as e:
+            out[name] = {"status": None, "exception": f"{type(e).__name__}: {e}"}
+    return out
+
 @app.get("/health")
 def health(): return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}

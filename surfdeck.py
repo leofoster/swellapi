@@ -10,6 +10,7 @@ Architecture:
 """
 
 import math
+import os
 import requests
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -17,6 +18,30 @@ from typing import Optional
 import statistics
 import json
 from collections import Counter
+
+# ─────────────────────────────────────────────────────────────────
+#  UPSTREAM ROUTING
+# ─────────────────────────────────────────────────────────────────
+# Open-Meteo's free tier rejects calls from Render's shared datacenter IPs, so
+# requests can be routed through a proxy running on a residential connection
+# (see api_prox.py). Set OPEN_METEO_PROXY to that proxy's public base URL,
+# e.g. "https://something.ngrok-free.dev" — no trailing slash needed.
+# Unset means talk to Open-Meteo directly, which is the original behaviour.
+OPEN_METEO_PROXY   = os.environ.get("OPEN_METEO_PROXY", "").rstrip("/")
+OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
+
+MARINE_URL  = f"{OPEN_METEO_PROXY}/marine"   if OPEN_METEO_PROXY else "https://marine-api.open-meteo.com/v1/marine"
+WEATHER_URL = f"{OPEN_METEO_PROXY}/forecast" if OPEN_METEO_PROXY else "https://api.open-meteo.com/v1/forecast"
+
+_PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
+_PROXY_HEADERS: dict[str, str] = {}
+if OPEN_METEO_PROXY:
+    # Shared secret, so a public tunnel is not an open relay.
+    if _PROXY_TOKEN:
+        _PROXY_HEADERS["X-Proxy-Token"] = _PROXY_TOKEN
+    # ngrok's free tier can answer with an HTML interstitial instead of the
+    # JSON body, which would fail to parse. This header opts out of it.
+    _PROXY_HEADERS["ngrok-skip-browser-warning"] = "true"
 
 
 def safe_mean(values: list) -> Optional[float]:
@@ -122,8 +147,7 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
 def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "auto") -> Optional[list]:
     try:
         marine_resp = requests.get(
-           "https://marine-api.open-meteo.com/v1/marine",
-          # "https://stubble-number-federal.ngrok-free.dev/marine",
+            MARINE_URL,
             params={
                 "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "hourly": [
@@ -131,18 +155,17 @@ def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "aut
                     "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
                     "wind_wave_height", "wind_wave_period",
                 ],
-            }, timeout=10
+            }, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT
         )
         marine = marine_resp.json()
 
         weather_resp = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-           # "https://stubble-number-federal.ngrok-free.dev/forecast",
+            WEATHER_URL,
             params={
                 "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
                 "wind_speed_unit": "mph",
                 "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"],
-            }, timeout=10
+            }, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT
         )
         weather = weather_resp.json()
     except Exception as e:
