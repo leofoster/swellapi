@@ -1,91 +1,70 @@
-# SURFMOD runbook — ESP32 surf display
-
-Four systems, three handoffs, and one of them is a laptop. Written down because
-when the screen goes blank the failure could be at any hop.
+# SURFMOD runbook
 
 ## The path
 
-Trace it as Rufus, the ESP32 on the shelf, waking up to ask what the surf is
-doing:
-
 ```
-Rufus (ESP32)  --https-->  Render (api.py)  --https-->  ngrok  -->  your PC (api_prox.py)  -->  Open-Meteo
-   every 15 min              /esp/bermuda         tunnel            15-min cache
+GitHub Actions (hourly)  -->  Open-Meteo        build_static.py scores the forecast
+        |
+        v
+GitHub Pages (static JSON)  <--  ESP32 every 15 min, or the simulator in a browser
 ```
 
-| # | Step | Owner | Fails how | Recovery |
-|---|------|-------|-----------|----------|
-| 1 | Rufus joins wifi | Rufus | Screen: `wifi failed` | Check SSID/pass in `secrets.h`; ESP32 is 2.4GHz only, it cannot see a 5GHz-only SSID |
-| 2 | Rufus resolves + calls Render | Rufus | Screen: `DNS fail` / `TLS fail` / `HTTP -1` | `API_HOST` wrong. Scheme and trailing slash are tolerated; a typo is not |
-| 3 | Render runs the forecast | Render | Screen: `HTTP 502` | Hop 4 or 5 is down. Go to `/debug/upstream` |
-| 4 | Render reaches your PC via ngrok | You | 502, `/debug/upstream` shows an exception | ngrok URL rotated, or PC asleep. See "ngrok URL rotated" |
-| 5 | Proxy calls Open-Meteo | Your PC | 502, upstream `reason` names a limit | Rate limited even from home. Raise `PROXY_CACHE_TTL` |
-| 6 | Rufus parses ~950 bytes | Rufus | Screen: `json ...` | Hit an ngrok HTML interstitial or a truncated body. Check `/esp/bermuda?blocks=8` in a browser |
+No server, PC or tunnel in the path. If a build fails, the last good site stays
+live, and the device keeps showing what it has with a `!` until data recovers.
 
-## Bring it up
+| # | Step | Fails how | Where it shows | Recovery |
+|---|------|-----------|----------------|----------|
+| 1 | Action calls Open-Meteo | 429 / timeout | Actions tab: red run, log names the reason | Usually clears next hour. If it persists, see "Open-Meteo refuses" |
+| 2 | Action deploys Pages | Pages not enabled, permissions | Actions tab: `deploy` job red | Settings > Pages > Source: GitHub Actions |
+| 3 | Device joins WiFi | Wrong SSID/pass, 5 GHz network | Screen: `wifi failed` | Fix `secrets.h`. ESP32 is 2.4 GHz only |
+| 4 | Device fetches JSON | Wrong `API_URL` | Screen: `DNS fail` / `HTTP 404` | Check `API_URL` matches the Pages URL, path included |
+| 5 | Data ages out | Builds failing for hours | Screen: `!` top right; after 48h, `Forecast expired` | Fix step 1 or 2 |
 
-Terminal 1, on your PC:
+## First-time setup
+
+1. Push to `main`. Settings > Pages > Source: **GitHub Actions**.
+2. Actions tab > "Publish forecast" > Run workflow. When it's green, check
+   `https://<user>.github.io/swellapi/esp/bermuda` returns JSON.
+3. Firmware: copy `surf_oled/secrets_example.h` to `secrets.h`, set
+   `API_URL "https://<user>.github.io/swellapi"`, flash `surf_oled.ino`.
+
+## Local development
 
 ```bash
-export PROXY_TOKEN=<pick-a-secret>
-python api_prox.py                  # listens on 0.0.0.0:8000
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/pytest -q                              # scoring + API tests, no network
+.venv/bin/uvicorn api:app --reload               # live API, simulator at http://localhost:8000/sim/
+.venv/bin/python scripts/build_static.py         # build ./site exactly as CI does
+python3 -m http.server 8090 -d site              # serve it; simulator at http://localhost:8090/sim/
 ```
 
-Terminal 2:
+The simulator runs the same logic and layout as the firmware. Change and test
+there first (faults, clock warp, 128x32), then port the change to
+`surf_oled.ino`. The two must stay in sync by hand.
 
-```bash
-ngrok http 8000                     # copy the https://....ngrok-free.dev URL
-```
-
-Render dashboard, Environment, then let it redeploy:
-
-```
-OPEN_METEO_PROXY = https://<the-ngrok-host>      # no trailing slash
-PROXY_TOKEN      = <the same secret>
-```
-
-## Verify, in this order
-
-Stop at the first one that fails; that names the broken hop.
-
-```bash
-curl localhost:8000/health                                    # 1. proxy alive
-curl -H "X-Proxy-Token: $PROXY_TOKEN" \
-  "https://<ngrok-host>/marine?latitude=32.3&longitude=-64.8&hourly=swell_wave_height&forecast_days=1"
-                                                              # 2. tunnel + token
-curl https://swellapi-cayi.onrender.com/debug/upstream        # 3. Render -> Open-Meteo
-curl https://swellapi-cayi.onrender.com/esp/bermuda?blocks=8  # 4. what Rufus sees
-```
-
-Then Rufus: Arduino IDE, Serial Monitor, 115200. It prints the URL, the
-resolved IP, `TLS ok`, and any failure reason.
+A real ESP32 can point at your dev machine: `API_URL "http://<your-lan-ip>:8000"`.
 
 ## Known failure points
 
-**ngrok URL rotated.** Free ngrok issues a new hostname every restart, and
-Render is holding the old one. Symptom: everything worked yesterday, 502 today.
-Fix: copy the new URL into `OPEN_METEO_PROXY` and redeploy. This will keep
-happening; a reserved domain on a paid plan or a different tunnel is the only
-real fix.
+**Open-Meteo refuses.** The free tier limits requests per IP per day. GitHub's
+runners are shared too, but each run is about 4 calls and runs land on
+different machines. Unverified long term: if 429s become routine, the fix is an
+Open-Meteo API key (paid), not another proxy.
 
-**PC asleep or proxy not running.** Same 502. The whole design depends on your
-machine being awake. Disable sleep on the machine, or accept the outage.
+**Scheduled runs pause.** GitHub disables schedules after 60 days with no repo
+activity. Re-enable from the Actions tab.
 
-**Render free tier cold start.** First request after ~15 min idle takes 30-60s.
-Rufus allows 60s and retries after a minute, so a cold start looks like one
-blank cycle, not a permanent failure.
+**Schedule drift.** GitHub can delay cron runs by several minutes or skip one
+under load. Data covers 48h, so a missed hour is invisible.
 
-**Proxy cache is memory only.** Restarting the proxy drops it and the next
-request goes upstream. Not a fault, just don't expect the cache to survive.
-
-## Escape hatch
-
-To cut the PC and ngrok out entirely, clear `OPEN_METEO_PROXY` on Render. Calls
-go straight to Open-Meteo, which is the original behaviour — and which 502s from
-Render's datacenter IPs. Only useful for confirming the proxy is the variable.
+**Render (optional live API).** Same shared-IP 429 problem, plus a 30-60s cold
+start. `/debug/upstream` shows what Open-Meteo says over the route the app
+actually uses. `api_prox.py` is the old home-PC relay; it is not needed for the
+default setup.
 
 ## Not yet true
 
-Tides come from `fetch_mock_tides` — a synthetic generator, not real tide data.
-Nothing on Rufus's screen shows tides today, but `/forecast` returns them and
-they should not be trusted.
+- Tides: `fetch_mock_tides` is synthetic. It is off unless `MOCK_TIDES=1`, and
+  never affects ratings by default.
+- Buoy data (NDBC) is fetched by nothing; confidence is model-only.
+- Firmware v2 has not been compiled or run on hardware yet. The simulator has.

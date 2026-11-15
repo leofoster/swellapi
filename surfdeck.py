@@ -11,24 +11,36 @@ Architecture:
 
 import math
 import os
+import threading
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
 import statistics
-import json
-from collections import Counter
 
 # ─────────────────────────────────────────────────────────────────
 #  UPSTREAM ROUTING
 # ─────────────────────────────────────────────────────────────────
-# Open-Meteo's free tier rejects calls from Render's shared datacenter IPs, so
-# requests can be routed through a proxy running on a residential connection
-# (see api_prox.py). Set OPEN_METEO_PROXY to that proxy's public base URL,
-# e.g. "https://something.ngrok-free.dev" — no trailing slash needed.
-# Unset means talk to Open-Meteo directly, which is the original behaviour.
+# Open-Meteo's free tier limits requests per IP per day. Render's free tier
+# shares outbound IPs with other customers, so that budget is often gone
+# before we use it (429 "Daily API request limit exceeded").
+#
+# The primary deployment is now scripts/build_static.py on a GitHub Actions
+# schedule (see RUNBOOK.md), which makes ~4 calls an hour. This module still
+# supports an optional relay (api_prox.py) via OPEN_METEO_PROXY for anyone
+# running the live API somewhere with a shared IP.
 OPEN_METEO_PROXY   = os.environ.get("OPEN_METEO_PROXY", "").rstrip("/")
 OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
+# Open-Meteo refreshes hourly, so re-asking more often only burns the quota.
+OPEN_METEO_CACHE_TTL = float(os.environ.get("OPEN_METEO_CACHE_TTL", "1800"))
+# Tides are synthetic (see fetch_mock_tides). Off unless explicitly enabled so
+# fake data never moves real ratings.
+MOCK_TIDES = os.environ.get("MOCK_TIDES", "") == "1"
+
+
+class UpstreamError(RuntimeError):
+    """Open-Meteo could not be reached or refused the request. Message is the reason."""
 
 MARINE_URL  = f"{OPEN_METEO_PROXY}/marine"   if OPEN_METEO_PROXY else "https://marine-api.open-meteo.com/v1/marine"
 WEATHER_URL = f"{OPEN_METEO_PROXY}/forecast" if OPEN_METEO_PROXY else "https://api.open-meteo.com/v1/forecast"
@@ -56,7 +68,7 @@ class Island:
     offshore_lat: float
     offshore_lon: float
     buoy_ids: list[str]
-    timezone: str = "auto"
+    timezone: str = "UTC"
 
 @dataclass
 class SpotConfig:
@@ -96,7 +108,7 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
             offshore_lat=32.30,
             offshore_lon=-64.80,
             buoy_ids=["41049"],
-            timezone="America/Halifax",
+            timezone="Atlantic/Bermuda",
         ),
         {
             "south_shore": SpotConfig(
@@ -144,57 +156,78 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
 #  DATA FETCHING
 # ─────────────────────────────────────────────────────────────────
 
-def fetch_open_meteo(lat: float, lon: float, days: int = 7, timezone: str = "auto") -> Optional[list]:
+_session = requests.Session()
+_cache: dict[tuple, tuple[float, list]] = {}
+_cache_lock = threading.Lock()
+FORECAST_DAYS = 7   # always fetch the full window; callers slice, so one cache entry serves all
+
+
+def _get_json(url: str, params: dict, label: str) -> dict:
     try:
-        marine_resp = requests.get(
-            MARINE_URL,
-            params={
-                "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
-                "hourly": [
-                    "wave_height", "wave_direction", "wave_period", "swell_wave_height",
-                    "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
-                    "wind_wave_height", "wind_wave_period",
-                ],
-            }, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT
-        )
-        marine = marine_resp.json()
+        resp = _session.get(url, params=params, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT)
+    except requests.RequestException as e:
+        raise UpstreamError(f"{label}: {type(e).__name__}: {e}") from e
+    try:
+        body = resp.json()
+    except ValueError:
+        raise UpstreamError(f"{label}: HTTP {resp.status_code}, non-JSON body: {resp.text[:120]!r}")
+    if resp.status_code != 200 or body.get("error") or "hourly" not in body:
+        reason = body.get("reason") or "no hourly data (no model coverage here?)"
+        raise UpstreamError(f"{label}: HTTP {resp.status_code}: {reason}")
+    return body
 
-        weather_resp = requests.get(
-            WEATHER_URL,
-            params={
-                "latitude": lat, "longitude": lon, "timezone": timezone, "forecast_days": days,
-                "wind_speed_unit": "mph",
-                "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"],
-            }, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT
-        )
-        weather = weather_resp.json()
-    except Exception as e:
-        print(f"  ❌ Open-Meteo request failed: {e}")
-        return None
 
-    # NEW: check for API-level errors before indexing into the response
-    if marine.get("error") or "hourly" not in marine:
-        print(f"  ❌ Marine API error for ({lat}, {lon}): {marine.get('reason', 'no hourly data — likely no marine model coverage at this location')}")
-        return None
+def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
+    """Hourly marine + wind data for the next FORECAST_DAYS days.
 
-    if weather.get("error") or "hourly" not in weather:
-        print(f"  ❌ Weather API error for ({lat}, {lon}): {weather.get('reason', 'unknown error')}")
-        return None
+    Times are returned as timezone-aware UTC ISO strings, so callers never have
+    to guess what zone a naive timestamp was in. Raises UpstreamError.
+    Results are cached for OPEN_METEO_CACHE_TTL seconds per location.
+    """
+    key = (round(lat, 3), round(lon, 3))
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and now - hit[0] < OPEN_METEO_CACHE_TTL:
+            return hit[1]
+
+    common = {"latitude": lat, "longitude": lon, "timezone": "GMT", "forecast_days": FORECAST_DAYS}
+    marine = _get_json(MARINE_URL, {**common, "hourly": [
+        "wave_height", "wave_direction", "wave_period", "swell_wave_height",
+        "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
+        "wind_wave_height", "wind_wave_period",
+    ]}, "marine")
+    weather = _get_json(WEATHER_URL, {**common, "wind_speed_unit": "mph",
+        "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]}, "weather")
 
     mh, wh = marine["hourly"], weather["hourly"]
-    return [{
-        "time":                mh["time"][i],
-        "swell_height_m":      mh["swell_wave_height"][i],
-        "swell_direction_deg": mh["swell_wave_direction"][i],
-        "swell_period_s":      mh["swell_wave_period"][i],
-        "swell_peak_period_s": mh["swell_wave_peak_period"][i],
-        "wave_height_m":       mh["wave_height"][i],
-        "wind_wave_height_m":  mh["wind_wave_height"][i],
-        "wind_wave_period_s":  mh["wind_wave_period"][i],
-        "wind_speed_mph":      wh["wind_speed_10m"][i],
-        "wind_direction_deg":  wh["wind_direction_10m"][i],
-        "wind_gusts_mph":      wh["wind_gusts_10m"][i],
-    } for i in range(len(mh["time"]))]
+    # Align on timestamp rather than index, in case the two models differ in length.
+    w_idx = {t: i for i, t in enumerate(wh["time"])}
+    rows = []
+    for i, t in enumerate(mh["time"]):
+        j = w_idx.get(t)
+        rows.append({
+            "time":                datetime.fromisoformat(t).replace(tzinfo=timezone.utc).isoformat(),
+            "swell_height_m":      mh["swell_wave_height"][i],
+            "swell_direction_deg": mh["swell_wave_direction"][i],
+            "swell_period_s":      mh["swell_wave_period"][i],
+            "swell_peak_period_s": mh["swell_wave_peak_period"][i],
+            "wave_height_m":       mh["wave_height"][i],
+            "wind_wave_height_m":  mh["wind_wave_height"][i],
+            "wind_wave_period_s":  mh["wind_wave_period"][i],
+            "wind_speed_mph":      wh["wind_speed_10m"][j] if j is not None else None,
+            "wind_direction_deg":  wh["wind_direction_10m"][j] if j is not None else None,
+            "wind_gusts_mph":      wh["wind_gusts_10m"][j] if j is not None else None,
+        })
+
+    with _cache_lock:
+        _cache[key] = (now, rows)
+    return rows
+
+
+def get_tides(lat: float, lon: float, days: int, now: datetime) -> Optional[dict]:
+    """Tide data for scoring, or None. Only the mock exists today, behind MOCK_TIDES=1."""
+    return fetch_mock_tides(lat, lon, days, now) if MOCK_TIDES else None
 
 def fetch_mock_tides(lat: float, lon: float, days: int, now: datetime) -> dict:
     """
@@ -466,112 +499,3 @@ def deg_to_compass(deg: Optional[float]) -> str:
     if deg is None: return "---"
     dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
     return dirs[round(deg / 22.5) % 16]
-
-def _condense_day_hours(hours: list[dict], spot: SpotConfig, buoy_summary: Optional[dict], now: datetime, tide_data: Optional[dict] = None) -> dict:
-    if not hours: return {"quality": "NO DATA", "score_overall": 0.0}
-
-    inferred_list, confidence_list, quality_labels = [], [], []
-
-    for hour in hours:
-        dt = datetime.fromisoformat(hour["time"]).astimezone(timezone.utc)
-        hours_from_now = max(0, int((dt - now).total_seconds() / 3600))
-        
-        tide_hour = tide_data["hourly"].get(dt.strftime("%Y-%m-%dT%H")) if tide_data else None
-        
-        inf = infer_spot(hour, spot, tide_hour)
-        conf = build_confidence(hour, buoy_summary, hours_from_now)
-        inferred_list.append(inf)
-        confidence_list.append(conf)
-        quality_labels.append(inf["quality"])
-
-    avg_score   = safe_mean([i["score_overall"] for i in inferred_list])
-    avg_height  = safe_mean([i["effective_height_m"] for i in inferred_list])
-    avg_conf    = safe_mean([c["confidence"] for c in confidence_list])
-    modal_quality = Counter(quality_labels).most_common(1)[0][0]
-    avg_conf_label = "HIGH" if (avg_conf or 0) >= 0.75 else "MEDIUM" if (avg_conf or 0) >= 0.50 else "LOW"
-
-    best_idx  = max(range(len(inferred_list)), key=lambda i: inferred_list[i]["score_overall"])
-    best_inf, best_conf, best_hour = inferred_list[best_idx], confidence_list[best_idx], hours[best_idx]
-    peak_dt = datetime.fromisoformat(best_hour["time"]).astimezone(timezone.utc)
-
-    all_flags = []
-    for c in confidence_list: all_flags.extend(c["flags"])
-    unique_flags = list(dict.fromkeys(f for f in all_flags if "confirms model" not in f))[:3]
-
-    return {
-        "quality":           modal_quality,
-        "score_overall":     round(avg_score or 0, 3),
-        "avg_height_m":      round(avg_height or 0, 2),
-        "confidence":        round(avg_conf or 0, 2),
-        "confidence_label":  avg_conf_label,
-        "spot_name":         spot.name,
-        "shore":             spot.shore,
-        "break_type":        spot.break_type,
-        "peak": {
-            "time":          peak_dt.strftime("%H:%M"),
-            "score":         round(best_inf["score_overall"], 3),
-            "quality":       best_inf["quality"],
-            "swell_height_m":best_inf["effective_height_m"],
-            "swell_period_s":best_hour.get("swell_period_s"),
-            "swell_dir":     deg_to_compass(best_hour.get("swell_direction_deg")),
-            "wind_speed_mph":best_hour.get("wind_speed_mph"),
-            "wind_dir":      deg_to_compass(best_hour.get("wind_direction_deg")),
-            "is_wrap":       best_inf["is_wrap_event"],
-            "in_shadow":     best_inf["in_shadow"],
-            "confidence":    round(best_conf["confidence"], 2),
-        },
-        "flags": unique_flags,
-    }
-
-def export_forecast_json(island_key: str, days_ahead: int = 3, output_path: Optional[str] = None) -> dict:
-    island, spots = ISLANDS[island_key]
-    now = datetime.now(timezone.utc)
-    today = now.date()
-
-    buoys = fetch_all_buoys(island.buoy_ids)
-    buoy_summary = summarise_buoys(buoys)
-
-    fetch_days = days_ahead + 2
-    forecast = fetch_open_meteo(island.offshore_lat, island.offshore_lon, days=fetch_days, timezone=island.timezone)
-    if not forecast: raise RuntimeError("Could not fetch model data from Open-Meteo.")
-    
-    # Generate tides for the same span
-    tide_data = fetch_mock_tides(island.offshore_lat, island.offshore_lon, fetch_days, now)
-
-    by_date: dict[str, list[dict]] = {}
-    for hour in forecast:
-        date_key = hour["time"][:10]
-        by_date.setdefault(date_key, []).append(hour)
-
-    target_dates = [str(today + timedelta(days=d)) for d in range(days_ahead + 1)]
-
-    days_out = []
-    for idx, date_str in enumerate(target_dates):
-        label = "Today" if idx == 0 else "Tomorrow" if idx == 1 else datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
-        day_hours = by_date.get(date_str, [])
-        spot_readings = {}
-        for spot_key, spot in spots.items():
-            spot_readings[spot_key] = _condense_day_hours(day_hours, spot, buoy_summary, now, tide_data)
-
-        # Grab daily tide extremes
-        tide_extremes = tide_data.get("extremes", {}).get(date_str, {"high": [], "low": []})
-
-        days_out.append({
-            "date":  date_str,
-            "label": label,
-            "high_tides": [f"{t['time']} ({t['height_m']}m)" for t in tide_extremes.get("high", [])],
-            "low_tides":  [f"{t['time']} ({t['height_m']}m)" for t in tide_extremes.get("low", [])],
-            "spots": spot_readings,
-        })
-
-    payload = {
-        "island":      island.name,
-        "island_key":  island_key,
-        "generated":   now.isoformat(timespec="seconds"),
-        "buoy":        buoy_summary,
-        "days":        days_out,
-    }
-
-    if output_path:
-        with open(output_path, "w") as f: json.dump(payload, f, indent=2, default=str)
-    return payload

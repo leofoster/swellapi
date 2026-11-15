@@ -1,0 +1,5 @@
+# Only for scripts/ocean_swell_map.py (needs Python 3.10+)
+requests
+numpy
+matplotlib
+scipy

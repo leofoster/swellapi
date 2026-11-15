@@ -1,19 +1,36 @@
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+import math
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Optional
-from datetime import datetime, timezone, timedelta
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover
+    raise SystemExit("Python 3.9+ required")
+
+import surfdeck
 from surfdeck import (
     SpotConfig,
+    UpstreamError,
     infer_spot,
     build_confidence,
     fetch_open_meteo,
-    fetch_mock_tides,
+    get_tides,
     deg_to_compass,
     safe_mean,
-    export_forecast_json,
     ISLANDS,
 )
+
+# ─────────────────────────────────────────────────────────────────
+#  MODELS
+# ─────────────────────────────────────────────────────────────────
 
 class SpotRequest(BaseModel):
     spot_name:          str   = "Unknown Spot"
@@ -37,16 +54,16 @@ class SpotRequest(BaseModel):
     exposure:           float = 1.0
     shadow_zones:       list[list[float]] = []
     wrap_factor:        float = 0.0
-    
-    # ── New Optional Tide parameters ─────────────────────────────────
-    tide_level_ideal:   Optional[str] = Field(default=None, description="e.g., 'low', 'mid', 'high', 'low-mid', 'mid-high'")
-    tide_movement_ideal:Optional[str] = Field(default=None, pattern="^(rising|falling)$")
 
-    days:               int   = 3
-    timezone:           str   = "UTC"
+    tide_level_ideal:    Optional[str] = Field(default=None, description="low | low-mid | mid | mid-high | high")
+    tide_movement_ideal: Optional[str] = Field(default=None, pattern="^(rising|falling)$")
+
+    days:               int   = Field(default=3, ge=1, le=6)
+    timezone:           str   = Field(default="UTC", description="IANA zone for labels and day grouping, e.g. Atlantic/Bermuda")
+
 
 class HourlyReading(BaseModel):
-    time:                str
+    time:                str        # ISO 8601 in the request's timezone
     hour_label:          str
     hours_from_now:      int
 
@@ -58,8 +75,7 @@ class HourlyReading(BaseModel):
     wind_direction_deg:  Optional[float]
     wind_direction_compass: str
     wind_gusts_mph:      Optional[float]
-    
-    # ── New Tide outputs ─────────────────────────────────────────────
+
     tide_height_m:       Optional[float]
     tide_status:         Optional[str]
     score_tide_mod:      Optional[float]
@@ -77,14 +93,12 @@ class HourlyReading(BaseModel):
     confidence:          float
     confidence_label:    str
 
+
 class DaySummary(BaseModel):
     date:           str
     day_label:      str
-    
-    # ── New Tide extremes output ─────────────────────────────────────
     high_tides:     list[str]
     low_tides:      list[str]
-    
     modal_quality:  str
     avg_score:      float
     avg_height_m:   float
@@ -93,302 +107,329 @@ class DaySummary(BaseModel):
     peak_score:     float
     hours:          list[HourlyReading]
 
+
 class ForecastResponse(BaseModel):
     spot_name:   str
     lat:         float
     lon:         float
+    timezone:    str
     generated:   str
+    tides_are_mock: bool
     days:        list[DaySummary]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  CORE
+# ─────────────────────────────────────────────────────────────────
+
+def _zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(status_code=422, detail=f"Unknown timezone {name!r}")
+
 
 def request_to_spot_config(req: SpotRequest) -> SpotConfig:
     return SpotConfig(
-        name               = req.spot_name,
-        shore              = "unknown",
-        swell_dir_min      = req.swell_dir_min,
-        swell_dir_max      = req.swell_dir_max,
-        swell_dir_ideal    = req.swell_dir_ideal,
-        swell_period_min   = req.swell_period_min,
-        swell_period_ideal = req.swell_period_ideal,
-        swell_height_min   = req.swell_height_min,
-        swell_height_ideal = req.swell_height_ideal,
-        swell_height_max   = req.swell_height_max,
-        wind_offshore_min  = req.wind_offshore_min,
-        wind_offshore_max  = req.wind_offshore_max,
-        wind_speed_max     = req.wind_speed_max,
-        break_type         = req.break_type,
-        exposure           = req.exposure,
-        shadow_zones       = [tuple(z) for z in req.shadow_zones],
-        wrap_factor        = req.wrap_factor,
-        tide_level_ideal   = req.tide_level_ideal,
-        tide_movement_ideal= req.tide_movement_ideal,
+        name=req.spot_name, shore="unknown",
+        swell_dir_min=req.swell_dir_min, swell_dir_max=req.swell_dir_max, swell_dir_ideal=req.swell_dir_ideal,
+        swell_period_min=req.swell_period_min, swell_period_ideal=req.swell_period_ideal,
+        swell_height_min=req.swell_height_min, swell_height_ideal=req.swell_height_ideal,
+        swell_height_max=req.swell_height_max,
+        wind_offshore_min=req.wind_offshore_min, wind_offshore_max=req.wind_offshore_max,
+        wind_speed_max=req.wind_speed_max,
+        break_type=req.break_type, exposure=req.exposure,
+        shadow_zones=[tuple(z) for z in req.shadow_zones], wrap_factor=req.wrap_factor,
+        tide_level_ideal=req.tide_level_ideal, tide_movement_ideal=req.tide_movement_ideal,
     )
 
-def build_hourly_reading(
-    hour:           dict,
-    spot:           SpotConfig,
-    buoy_summary:   Optional[dict],
-    now:            datetime,
-    tide_data:      Optional[dict] = None,
-) -> HourlyReading:
-    
-    dt = datetime.fromisoformat(hour["time"]).astimezone(timezone.utc)
-    hours_from_now = max(0, int((dt - now).total_seconds() / 3600))
-    
-    dt_str_key = dt.strftime("%Y-%m-%dT%H")
-    tide_hour = tide_data["hourly"].get(dt_str_key) if tide_data else None
 
+def spot_to_request(spot: SpotConfig, lat: float, lon: float, days: int, tz: str) -> SpotRequest:
+    return SpotRequest(
+        spot_name=spot.name, lat=lat, lon=lon,
+        swell_dir_min=spot.swell_dir_min, swell_dir_max=spot.swell_dir_max, swell_dir_ideal=spot.swell_dir_ideal,
+        swell_period_min=spot.swell_period_min, swell_period_ideal=spot.swell_period_ideal,
+        swell_height_min=spot.swell_height_min, swell_height_ideal=spot.swell_height_ideal,
+        swell_height_max=spot.swell_height_max,
+        wind_offshore_min=spot.wind_offshore_min, wind_offshore_max=spot.wind_offshore_max,
+        wind_speed_max=spot.wind_speed_max,
+        break_type=spot.break_type, exposure=spot.exposure,
+        shadow_zones=[list(z) for z in spot.shadow_zones], wrap_factor=spot.wrap_factor,
+        tide_level_ideal=spot.tide_level_ideal, tide_movement_ideal=spot.tide_movement_ideal,
+        days=days, timezone=tz,
+    )
+
+
+def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[dict],
+                         now: datetime, tz: ZoneInfo, tide_data: Optional[dict] = None) -> HourlyReading:
+    dt_utc = datetime.fromisoformat(hour["time"]).astimezone(timezone.utc)
+    local  = dt_utc.astimezone(tz)
+    hours_from_now = max(0, int((dt_utc - now).total_seconds() // 3600))
+
+    tide_hour  = tide_data["hourly"].get(dt_utc.strftime("%Y-%m-%dT%H")) if tide_data else None
     inferred   = infer_spot(hour, spot, tide_hour)
     confidence = build_confidence(hour, buoy_summary, hours_from_now)
 
     return HourlyReading(
-        time                     = dt.isoformat(),
-        hour_label               = dt.strftime("%a %H:%M"),
-        hours_from_now           = hours_from_now,
-        swell_height_m           = hour.get("swell_height_m"),
-        swell_period_s           = hour.get("swell_period_s"),
-        swell_direction_deg      = hour.get("swell_direction_deg"),
-        swell_direction_compass  = deg_to_compass(hour.get("swell_direction_deg")),
-        wind_speed_mph           = hour.get("wind_speed_mph"),
-        wind_direction_deg       = hour.get("wind_direction_deg"),
-        wind_direction_compass   = deg_to_compass(hour.get("wind_direction_deg")),
-        wind_gusts_mph           = hour.get("wind_gusts_mph"),
-        
-        tide_height_m            = tide_hour["height_m"] if tide_hour else None,
-        tide_status              = tide_hour["status"] if tide_hour else None,
-        score_tide_mod           = inferred.get("score_tide_mod", 0.0),
-
-        score_direction          = inferred["score_direction"],
-        score_period             = inferred["score_period"],
-        score_height             = inferred["score_height"],
-        score_wind               = inferred["score_wind"],
-        score_overall            = inferred["score_overall"],
-        quality                  = inferred["quality"],
-
-        effective_height_m       = inferred["effective_height_m"],
-        in_shadow                = inferred["in_shadow"],
-        is_wrap                  = inferred["is_wrap_event"],
-        confidence               = confidence["confidence"],
-        confidence_label         = confidence["label"],
+        time=local.isoformat(), hour_label=local.strftime("%a %H:%M"), hours_from_now=hours_from_now,
+        swell_height_m=hour.get("swell_height_m"),
+        swell_period_s=hour.get("swell_period_s"),
+        swell_direction_deg=hour.get("swell_direction_deg"),
+        swell_direction_compass=deg_to_compass(hour.get("swell_direction_deg")),
+        wind_speed_mph=hour.get("wind_speed_mph"),
+        wind_direction_deg=hour.get("wind_direction_deg"),
+        wind_direction_compass=deg_to_compass(hour.get("wind_direction_deg")),
+        wind_gusts_mph=hour.get("wind_gusts_mph"),
+        tide_height_m=tide_hour["height_m"] if tide_hour else None,
+        tide_status=tide_hour["status"] if tide_hour else None,
+        score_tide_mod=inferred.get("score_tide_mod", 0.0),
+        score_direction=inferred["score_direction"],
+        score_period=inferred["score_period"],
+        score_height=inferred["score_height"],
+        score_wind=inferred["score_wind"],
+        score_overall=inferred["score_overall"],
+        quality=inferred["quality"],
+        effective_height_m=inferred["effective_height_m"],
+        in_shadow=inferred["in_shadow"],
+        is_wrap=inferred["is_wrap_event"],
+        confidence=confidence["confidence"],
+        confidence_label=confidence["label"],
     )
 
-def group_into_days(
-    readings: list[HourlyReading],
-    days:     int,
-    now:      datetime,
-    tide_data: Optional[dict] = None,
-) -> list[DaySummary]:
-    from collections import defaultdict, Counter
 
+def group_into_days(readings: list[HourlyReading], days: int, now: datetime, tz: ZoneInfo,
+                    tide_data: Optional[dict] = None) -> list[DaySummary]:
     by_date: dict[str, list[HourlyReading]] = defaultdict(list)
     for r in readings:
-        date_key = r.time[:10]
-        by_date[date_key].append(r)
+        by_date[r.time[:10]].append(r)          # r.time is local, so this is the local date
 
-    today = now.date()
+    today = now.astimezone(tz).date()
     summaries = []
-
     for d in range(days):
-        date       = today + timedelta(days=d)
-        date_str   = str(date)
-        day_hours  = by_date.get(date_str, [])
+        date      = today + timedelta(days=d)
+        date_str  = str(date)
+        day_hours = by_date.get(date_str, [])
+        label     = "Today" if d == 0 else "Tomorrow" if d == 1 else date.strftime("%A")
 
-        label = "Today" if d == 0 else "Tomorrow" if d == 1 else date.strftime("%A")
-        
-        # Format the highs/lows for JSON response
-        tide_extremes = tide_data.get("extremes", {}).get(date_str, {"high": [], "low": []}) if tide_data else {"high": [], "low": []}
-        highs = [f"{t['time']} ({t['height_m']}m)" for t in tide_extremes.get("high", [])]
-        lows  = [f"{t['time']} ({t['height_m']}m)" for t in tide_extremes.get("low", [])]
+        ext   = (tide_data or {}).get("extremes", {}).get(date_str, {})
+        highs = [f"{t['time']} ({t['height_m']}m)" for t in ext.get("high", [])]
+        lows  = [f"{t['time']} ({t['height_m']}m)" for t in ext.get("low", [])]
 
         if not day_hours:
             summaries.append(DaySummary(
                 date=date_str, day_label=label, high_tides=highs, low_tides=lows,
-                modal_quality="NO DATA", avg_score=0.0, avg_height_m=0.0, 
+                modal_quality="NO DATA", avg_score=0.0, avg_height_m=0.0,
                 peak_hour="--", peak_quality="NO DATA", peak_score=0.0, hours=[],
             ))
             continue
 
-        scores, heights, qualities = [h.score_overall for h in day_hours], [h.effective_height_m for h in day_hours], [h.quality for h in day_hours]
-        best, peak_dt = max(day_hours, key=lambda h: h.score_overall), datetime.fromisoformat(max(day_hours, key=lambda h: h.score_overall).time)
-
+        best = max(day_hours, key=lambda h: h.score_overall)
         summaries.append(DaySummary(
-            date          = date_str,
-            day_label     = label,
-            high_tides    = highs,
-            low_tides     = lows,
-            modal_quality = Counter(qualities).most_common(1)[0][0],
-            avg_score     = round(safe_mean(scores) or 0, 3),
-            avg_height_m  = round(safe_mean(heights) or 0, 2),
-            peak_hour     = peak_dt.strftime("%H:%M"),
-            peak_quality  = best.quality,
-            peak_score    = round(best.score_overall, 3),
-            hours         = day_hours,
+            date=date_str, day_label=label, high_tides=highs, low_tides=lows,
+            modal_quality=Counter(h.quality for h in day_hours).most_common(1)[0][0],
+            avg_score=round(safe_mean([h.score_overall for h in day_hours]) or 0, 3),
+            avg_height_m=round(safe_mean([h.effective_height_m for h in day_hours]) or 0, 2),
+            peak_hour=datetime.fromisoformat(best.time).strftime("%H:%M"),
+            peak_quality=best.quality,
+            peak_score=round(best.score_overall, 3),
+            hours=day_hours,
         ))
     return summaries
 
-app = FastAPI(title="Surf Forecast API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 
-@app.post("/forecast", response_model=ForecastResponse)
-def post_forecast(req: SpotRequest):
-    now  = datetime.now(timezone.utc)
+def compute_forecast(req: SpotRequest, now: Optional[datetime] = None) -> ForecastResponse:
+    now  = now or datetime.now(timezone.utc)
+    tz   = _zone(req.timezone)
     spot = request_to_spot_config(req)
 
-    fetch_days = min(req.days + 1, 7)
-    forecast = fetch_open_meteo(req.lat, req.lon, days=fetch_days, timezone=req.timezone)
-    if not forecast: raise HTTPException(status_code=502, detail="Could not fetch Open-Meteo data")
-    
-    # ── Fetch generated tide data ────────────────────────────────
-    tide_data = fetch_mock_tides(req.lat, req.lon, fetch_days, now)
+    try:
+        forecast = fetch_open_meteo(req.lat, req.lon)
+    except UpstreamError as e:
+        raise HTTPException(status_code=502, detail=f"Open-Meteo: {e}")
 
-    cap = req.days * 24
-    readings = [build_hourly_reading(hour, spot, None, now, tide_data) for hour in forecast[:cap]]
-    days_out = group_into_days(readings, req.days, now, tide_data)
+    tide_data = get_tides(req.lat, req.lon, req.days + 1, now)
 
-    return ForecastResponse(spot_name=req.spot_name, lat=req.lat, lon=req.lon, generated=now.isoformat(timespec="seconds"), days=days_out)
+    # Keep hours from local midnight today through the last requested day.
+    start = datetime.combine(now.astimezone(tz).date(), datetime.min.time(), tz)
+    end   = start + timedelta(days=req.days)
+    hours = [h for h in forecast if start <= datetime.fromisoformat(h["time"]) < end]
 
-@app.get("/forecast/{island_key}", response_model=ForecastResponse)
-def get_island_forecast(island_key: str, days: int = 3):
-    if island_key not in ISLANDS: raise HTTPException(status_code=404, detail=f"Unknown island. Available: {list(ISLANDS.keys())}")
-    island, spots = ISLANDS[island_key]
-    first_spot = next(iter(spots.values()))
-    req = SpotRequest(
-        spot_name=first_spot.name, lat=island.offshore_lat, lon=island.offshore_lon,
-        swell_dir_min=first_spot.swell_dir_min, swell_dir_max=first_spot.swell_dir_max, swell_dir_ideal=first_spot.swell_dir_ideal,
-        swell_period_min=first_spot.swell_period_min, swell_period_ideal=first_spot.swell_period_ideal,
-        swell_height_min=first_spot.swell_height_min, swell_height_ideal=first_spot.swell_height_ideal, swell_height_max=first_spot.swell_height_max,
-        wind_offshore_min=first_spot.wind_offshore_min, wind_offshore_max=first_spot.wind_offshore_max, wind_speed_max=first_spot.wind_speed_max,
-        break_type=first_spot.break_type, exposure=first_spot.exposure, days=days,
-        tide_level_ideal=first_spot.tide_level_ideal, tide_movement_ideal=first_spot.tide_movement_ideal
+    readings = [build_hourly_reading(h, spot, None, now, tz, tide_data) for h in hours]
+    return ForecastResponse(
+        spot_name=req.spot_name, lat=req.lat, lon=req.lon, timezone=req.timezone,
+        generated=now.isoformat(timespec="seconds"),
+        tides_are_mock=tide_data is not None,
+        days=group_into_days(readings, req.days, now, tz, tide_data),
     )
-    return post_forecast(req)
+
+
+def _island(island_key: str):
+    if island_key not in ISLANDS:
+        raise HTTPException(status_code=404, detail=f"Unknown island. Available: {list(ISLANDS)}")
+    return ISLANDS[island_key]
+
+
+def island_forecast(island_key: str, days: int = 3, spot_key: Optional[str] = None,
+                    now: Optional[datetime] = None) -> ForecastResponse:
+    island, spots = _island(island_key)
+    if spot_key is None:
+        spot_key = next(iter(spots))
+    if spot_key not in spots:
+        raise HTTPException(status_code=404, detail=f"Unknown spot. Available: {list(spots)}")
+    req = spot_to_request(spots[spot_key], island.offshore_lat, island.offshore_lon, days, island.timezone)
+    return compute_forecast(req, now)
+
 
 # ─────────────────────────────────────────────────────────────────
-#  ESP32 ENDPOINT — 3-hour blocks, short keys, minimal payload
+#  ESP32 PAYLOAD — 3-hour blocks, short keys, ~1 KB
 # ─────────────────────────────────────────────────────────────────
 
-# Mirrors the label_map thresholds in surfdeck.infer_spot().
+# Mirrors the thresholds in surfdeck.infer_spot(); "FLAT" fits the screen better than "FLAT/BLOWN".
 ESP_LABELS = [(0.85, "PUMPING"), (0.70, "GOOD"), (0.50, "FAIR"), (0.30, "POOR"), (0.00, "FLAT")]
+
 
 def _label_for(score: float) -> str:
     return next(lbl for thresh, lbl in ESP_LABELS if score >= thresh)
 
-def _circular_mean(degrees: list[float]) -> Optional[float]:
+
+def _circular_mean(degrees: list) -> Optional[float]:
     """Mean of compass bearings. A plain average of 350 and 10 gives 180, not 0."""
-    import math
     vals = [d for d in degrees if d is not None]
-    if not vals: return None
+    if not vals:
+        return None
     x = safe_mean([math.cos(math.radians(d)) for d in vals])
     y = safe_mean([math.sin(math.radians(d)) for d in vals])
-    if x is None or y is None: return None
     return round(math.degrees(math.atan2(y, x)) % 360, 1)
 
+
 class EspBlock(BaseModel):
-    t:  str                      # block label, e.g. "Mon 15"
-    hn: int                      # hours from now at block start
-    h:  Optional[float]          # swell height m (mean)
-    p:  Optional[float]          # swell period s (mean)
-    sd: str                      # swell direction compass
-    sg: Optional[float]          # swell direction deg
-    w:  Optional[float]          # wind speed mph (mean)
-    wd: str                      # wind direction compass
-    wg: Optional[float]          # wind direction deg
-    r:  float                    # rating 0.0-1.0
-    q:  str                      # rating label
+    t:  str              # local label, e.g. "Mon 15"
+    e:  int              # block start, unix seconds. Devices compute "+Nh" from this.
+    hn: int              # hours from generation time to block start (legacy; prefer e)
+    h:  Optional[float]  # effective swell height m
+    p:  Optional[float]  # swell period s
+    sd: str              # swell direction compass
+    sg: Optional[float]  # swell direction deg
+    w:  Optional[float]  # wind mph
+    wd: str              # wind direction compass
+    wg: Optional[float]  # wind direction deg
+    r:  float            # rating 0-1
+    q:  str              # rating label
+
 
 class EspResponse(BaseModel):
-    s:  str                      # spot name
-    g:  str                      # generated (UTC iso, seconds)
-    b:  list[EspBlock]           # blocks, soonest first
+    v:  int = 2          # payload version
+    s:  str              # spot name
+    g:  str              # generated, UTC ISO
+    gt: int              # generated, unix seconds
+    b:  list[EspBlock]
 
-@app.get("/esp/{island_key}", response_model=EspResponse)
-def get_esp_forecast(island_key: str, blocks: int = Query(8, ge=1, le=16)):
-    """Compact 3-hour-averaged forecast sized for a microcontroller display."""
-    # +1 day of slack: Open-Meteo hours start at local midnight, so the past
-    # hours we discard below would otherwise eat into the requested blocks.
-    hours_needed = blocks * 3
-    days = min(max(1, -(-hours_needed // 24)) + 1, 5)       # ceil, capped
-    full = get_island_forecast(island_key, days=days)
 
-    now       = datetime.now(timezone.utc)
+def esp_forecast(island_key: str, blocks: int = 8, spot_key: Optional[str] = None,
+                 now: Optional[datetime] = None) -> EspResponse:
+    now  = now or datetime.now(timezone.utc)
+    island, _ = _island(island_key)
+    tz   = _zone(island.timezone)
+    days = min(-(-(blocks * 3) // 24) + 1, 6)
+    full = island_forecast(island_key, days=days, spot_key=spot_key, now=now)
+
     this_hour = now.replace(minute=0, second=0, microsecond=0)
-
     readings = sorted(
-        (h for d in full.days for h in d.hours
-         if datetime.fromisoformat(h.time) >= this_hour),
-        key=lambda h: h.time,
+        (h for d in full.days for h in d.hours if datetime.fromisoformat(h.time) >= this_hour),
+        key=lambda h: datetime.fromisoformat(h.time),
     )
     if not readings:
         raise HTTPException(status_code=502, detail="No hourly data available")
 
     out: list[EspBlock] = []
     for i in range(0, len(readings), 3):
-        if len(out) >= blocks: break
+        if len(out) >= blocks:
+            break
         chunk = readings[i:i + 3]
         start = datetime.fromisoformat(chunk[0].time)
-        hn    = max(0, int((start - now).total_seconds() // 3600))
-
         score = round(safe_mean([h.score_overall for h in chunk]) or 0.0, 3)
-        swell_deg = _circular_mean([h.swell_direction_deg for h in chunk])
-        wind_deg  = _circular_mean([h.wind_direction_deg for h in chunk])
-        height    = safe_mean([h.effective_height_m for h in chunk])
-        period    = safe_mean([h.swell_period_s for h in chunk if h.swell_period_s is not None])
-        wind      = safe_mean([h.wind_speed_mph for h in chunk if h.wind_speed_mph is not None])
-
+        sdeg  = _circular_mean([h.swell_direction_deg for h in chunk])
+        wdeg  = _circular_mean([h.wind_direction_deg for h in chunk])
+        height = safe_mean([h.effective_height_m for h in chunk])
+        period = safe_mean([h.swell_period_s for h in chunk])
+        wind   = safe_mean([h.wind_speed_mph for h in chunk])
         out.append(EspBlock(
-            t  = start.strftime("%a %H"),
-            hn = hn,
-            h  = round(height, 2) if height is not None else None,
-            p  = round(period, 1) if period is not None else None,
-            sd = deg_to_compass(swell_deg),
-            sg = swell_deg,
-            w  = round(wind, 1) if wind is not None else None,
-            wd = deg_to_compass(wind_deg),
-            wg = wind_deg,
-            r  = score,
-            q  = _label_for(score),
+            t=start.astimezone(tz).strftime("%a %H"),
+            e=int(start.timestamp()),
+            hn=max(0, int((start - now).total_seconds() // 3600)),
+            h=round(height, 2) if height is not None else None,
+            p=round(period, 1) if period is not None else None,
+            sd=deg_to_compass(sdeg), sg=sdeg,
+            w=round(wind, 1) if wind is not None else None,
+            wd=deg_to_compass(wdeg), wg=wdeg,
+            r=score, q=_label_for(score),
         ))
 
-    return EspResponse(
-        s = full.spot_name,
-        g = datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        b = out,
-    )
+    return EspResponse(s=full.spot_name, g=now.isoformat(timespec="seconds"),
+                       gt=int(now.timestamp()), b=out)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  HTTP
+# ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Surf Forecast API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+
+_SIM_DIR = Path(__file__).parent / "simulator"
+if _SIM_DIR.is_dir():
+    app.mount("/sim", StaticFiles(directory=_SIM_DIR, html=True), name="sim")
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/sim/" if _SIM_DIR.is_dir() else "/docs")
+
+
+@app.post("/forecast", response_model=ForecastResponse)
+def post_forecast(req: SpotRequest):
+    return compute_forecast(req)
+
+
+@app.get("/forecast/{island_key}", response_model=ForecastResponse)
+def get_island_forecast(island_key: str, days: int = Query(3, ge=1, le=6), spot: Optional[str] = None):
+    return island_forecast(island_key, days=days, spot_key=spot)
+
+
+@app.get("/esp/{island_key}", response_model=EspResponse)
+def get_esp_forecast(island_key: str, blocks: int = Query(8, ge=1, le=16), spot: Optional[str] = None):
+    """Compact 3-hour-averaged forecast sized for a microcontroller display."""
+    return esp_forecast(island_key, blocks=blocks, spot_key=spot)
+
 
 @app.get("/islands")
-def list_islands(): return {"islands": {k: {"name": i.name, "spots": list(s.keys()), "lat": i.offshore_lat, "lon": i.offshore_lon} for k, (i, s) in ISLANDS.items()}}
+def list_islands():
+    return {"islands": {k: {"name": i.name, "timezone": i.timezone, "spots": list(s),
+                            "lat": i.offshore_lat, "lon": i.offshore_lon}
+                        for k, (i, s) in ISLANDS.items()}}
+
 
 @app.get("/debug/upstream")
 def debug_upstream(lat: float = 32.30, lon: float = -64.80):
-    """Report what Open-Meteo actually says, as seen from the server.
-
-    fetch_open_meteo() swallows upstream failures into a bare 502, which is
-    invisible once deployed. This exposes the real status and reason.
-    """
-    import requests
-    out = {}
-    targets = {
-        "marine":  ("https://marine-api.open-meteo.com/v1/marine",
-                    {"hourly": "swell_wave_height"}),
-        "weather": ("https://api.open-meteo.com/v1/forecast",
-                    {"hourly": "wind_speed_10m"}),
-    }
-    for name, (url, extra) in targets.items():
+    """What Open-Meteo says from this server, over the same route the app uses
+    (direct, or via OPEN_METEO_PROXY when set)."""
+    out = {"route": surfdeck.OPEN_METEO_PROXY or "direct"}
+    for name, url, extra in [("marine", surfdeck.MARINE_URL, {"hourly": "swell_wave_height"}),
+                             ("weather", surfdeck.WEATHER_URL, {"hourly": "wind_speed_10m"})]:
         try:
-            r = requests.get(url, params={"latitude": lat, "longitude": lon,
-                                          "forecast_days": 1, **extra}, timeout=10)
-            body = {}
-            try: body = r.json()
-            except Exception: pass
-            out[name] = {
-                "status":     r.status_code,
-                "error":      body.get("error"),
-                "reason":     body.get("reason"),
-                "has_hourly": "hourly" in body,
-                "snippet":    r.text[:200],
-            }
+            r = surfdeck._session.get(url, params={"latitude": lat, "longitude": lon, "forecast_days": 1, **extra},
+                                      headers=surfdeck._PROXY_HEADERS, timeout=10)
+            try:
+                body = r.json()
+            except ValueError:
+                body = {}
+            out[name] = {"status": r.status_code, "reason": body.get("reason"),
+                         "has_hourly": "hourly" in body, "snippet": r.text[:200]}
         except Exception as e:
             out[name] = {"status": None, "exception": f"{type(e).__name__}: {e}"}
     return out
 
+
 @app.get("/health")
-def health(): return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+def health():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
