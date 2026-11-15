@@ -21,7 +21,8 @@ from surfdeck import (
     UpstreamError,
     infer_spot,
     build_confidence,
-    fetch_open_meteo,
+    fetch_forecast,
+    quality_key,
     get_tides,
     deg_to_compass,
     safe_mean,
@@ -50,16 +51,16 @@ class SpotRequest(BaseModel):
     wind_offshore_max:  float
     wind_speed_max:     float = 20.0
 
-    break_type:         str   = Field(default="beach", pattern="^(beach|reef|point)$")
+    break_type:         str   = Field(default="beach", pattern="^(beach|reef|point|rivermouth)$")
     exposure:           float = 1.0
     shadow_zones:       list[list[float]] = []
     wrap_factor:        float = 0.0
 
-    tide_level_ideal:    Optional[str] = Field(default=None, description="low | low-mid | mid | mid-high | high")
+    tide_level_ideal:    Optional[str] = Field(default=None, description="low | mid-low (alias low-mid) | mid | mid-high | high")
     tide_movement_ideal: Optional[str] = Field(default=None, pattern="^(rising|falling)$")
 
-    days:               int   = Field(default=3, ge=1, le=6)
-    timezone:           str   = Field(default="UTC", description="IANA zone for labels and day grouping, e.g. Atlantic/Bermuda")
+    days:               int   = Field(default=3, ge=1, le=7)
+    timezone:           str   = Field(default="UTC", description='IANA zone (e.g. "Atlantic/Bermuda") or "auto" to use the spot\'s own zone')
 
 
 class HourlyReading(BaseModel):
@@ -84,8 +85,9 @@ class HourlyReading(BaseModel):
     score_period:        float
     score_height:        float
     score_wind:          float
-    score_overall:       float
-    quality:             str
+    score_overall:       float      # 0-1
+    quality:             str        # legacy uppercase label, e.g. POOR, FLAT/BLOWN
+    quality_key:         str        # flat | poor | poor_to_fair | fair | fair_to_good | good | epic
 
     effective_height_m:  float
     in_shadow:           bool
@@ -97,13 +99,15 @@ class HourlyReading(BaseModel):
 class DaySummary(BaseModel):
     date:           str
     day_label:      str
-    high_tides:     list[str]
-    low_tides:      list[str]
+    high_tides:     list[str] = []   # empty when no tide data
+    low_tides:      list[str] = []
     modal_quality:  str
+    quality_key:    str              # from avg_score
     avg_score:      float
     avg_height_m:   float
     peak_hour:      str
     peak_quality:   str
+    peak_quality_key: str
     peak_score:     float
     hours:          list[HourlyReading]
 
@@ -112,9 +116,9 @@ class ForecastResponse(BaseModel):
     spot_name:   str
     lat:         float
     lon:         float
-    timezone:    str
+    timezone:    str              # the zone actually used (resolved when the request said "auto")
     generated:   str
-    tides_are_mock: bool
+    tides_are_mock: bool           # true only when MOCK_TIDES=1; tide fields are null/empty otherwise
     days:        list[DaySummary]
 
 
@@ -189,6 +193,7 @@ def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[di
         score_wind=inferred["score_wind"],
         score_overall=inferred["score_overall"],
         quality=inferred["quality"],
+        quality_key=quality_key(inferred["score_overall"]),
         effective_height_m=inferred["effective_height_m"],
         in_shadow=inferred["in_shadow"],
         is_wrap=inferred["is_wrap_event"],
@@ -218,19 +223,22 @@ def group_into_days(readings: list[HourlyReading], days: int, now: datetime, tz:
         if not day_hours:
             summaries.append(DaySummary(
                 date=date_str, day_label=label, high_tides=highs, low_tides=lows,
-                modal_quality="NO DATA", avg_score=0.0, avg_height_m=0.0,
-                peak_hour="--", peak_quality="NO DATA", peak_score=0.0, hours=[],
+                modal_quality="NO DATA", quality_key="flat", avg_score=0.0, avg_height_m=0.0,
+                peak_hour="--", peak_quality="NO DATA", peak_quality_key="flat", peak_score=0.0, hours=[],
             ))
             continue
 
         best = max(day_hours, key=lambda h: h.score_overall)
+        avg  = safe_mean([h.score_overall for h in day_hours]) or 0
         summaries.append(DaySummary(
             date=date_str, day_label=label, high_tides=highs, low_tides=lows,
             modal_quality=Counter(h.quality for h in day_hours).most_common(1)[0][0],
-            avg_score=round(safe_mean([h.score_overall for h in day_hours]) or 0, 3),
+            quality_key=quality_key(avg),
+            avg_score=round(avg, 3),
             avg_height_m=round(safe_mean([h.effective_height_m for h in day_hours]) or 0, 2),
             peak_hour=datetime.fromisoformat(best.time).strftime("%H:%M"),
             peak_quality=best.quality,
+            peak_quality_key=best.quality_key,
             peak_score=round(best.score_overall, 3),
             hours=day_hours,
         ))
@@ -239,15 +247,21 @@ def group_into_days(readings: list[HourlyReading], days: int, now: datetime, tz:
 
 def compute_forecast(req: SpotRequest, now: Optional[datetime] = None) -> ForecastResponse:
     now  = now or datetime.now(timezone.utc)
-    tz   = _zone(req.timezone)
     spot = request_to_spot_config(req)
 
     try:
-        forecast = fetch_open_meteo(req.lat, req.lon)
+        forecast, spot_tz = fetch_forecast(req.lat, req.lon)
     except UpstreamError as e:
         raise HTTPException(status_code=502, detail=f"Open-Meteo: {e}")
 
-    tide_data = get_tides(req.lat, req.lon, req.days + 1, now)
+    tz_name = spot_tz if req.timezone.lower() == "auto" else req.timezone
+    tz = _zone(tz_name)
+
+    # Tides are optional: any failure means "no tide data", never a failed forecast.
+    try:
+        tide_data = get_tides(req.lat, req.lon, req.days + 1, now)
+    except Exception:
+        tide_data = None
 
     # Keep hours from local midnight today through the last requested day.
     start = datetime.combine(now.astimezone(tz).date(), datetime.min.time(), tz)
@@ -256,7 +270,7 @@ def compute_forecast(req: SpotRequest, now: Optional[datetime] = None) -> Foreca
 
     readings = [build_hourly_reading(h, spot, None, now, tz, tide_data) for h in hours]
     return ForecastResponse(
-        spot_name=req.spot_name, lat=req.lat, lon=req.lon, timezone=req.timezone,
+        spot_name=req.spot_name, lat=req.lat, lon=req.lon, timezone=tz_name,
         generated=now.isoformat(timespec="seconds"),
         tides_are_mock=tide_data is not None,
         days=group_into_days(readings, req.days, now, tz, tide_data),
@@ -325,14 +339,8 @@ class EspResponse(BaseModel):
     b:  list[EspBlock]
 
 
-def esp_forecast(island_key: str, blocks: int = 8, spot_key: Optional[str] = None,
-                 now: Optional[datetime] = None) -> EspResponse:
-    now  = now or datetime.now(timezone.utc)
-    island, _ = _island(island_key)
-    tz   = _zone(island.timezone)
-    days = min(-(-(blocks * 3) // 24) + 1, 6)
-    full = island_forecast(island_key, days=days, spot_key=spot_key, now=now)
-
+def esp_from_forecast(full: ForecastResponse, blocks: int, now: datetime) -> EspResponse:
+    tz = _zone(full.timezone)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     readings = sorted(
         (h for d in full.days for h in d.hours if datetime.fromisoformat(h.time) >= this_hour),
@@ -364,9 +372,26 @@ def esp_forecast(island_key: str, blocks: int = 8, spot_key: Optional[str] = Non
             wd=deg_to_compass(wdeg), wg=wdeg,
             r=score, q=_label_for(score),
         ))
-
     return EspResponse(s=full.spot_name, g=now.isoformat(timespec="seconds"),
                        gt=int(now.timestamp()), b=out)
+
+
+def _esp_days(blocks: int) -> int:
+    return min(-(-(blocks * 3) // 24) + 1, 7)
+
+
+def esp_forecast(island_key: str, blocks: int = 8, spot_key: Optional[str] = None,
+                 now: Optional[datetime] = None) -> EspResponse:
+    now = now or datetime.now(timezone.utc)
+    full = island_forecast(island_key, days=_esp_days(blocks), spot_key=spot_key, now=now)
+    return esp_from_forecast(full, blocks, now)
+
+
+def esp_for_spot(req: SpotRequest, blocks: int = 8, now: Optional[datetime] = None) -> EspResponse:
+    """Device payload for any spot profile, e.g. one saved in the web app."""
+    now = now or datetime.now(timezone.utc)
+    req = req.model_copy(update={"days": _esp_days(blocks)})
+    return esp_from_forecast(compute_forecast(req, now), blocks, now)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -392,7 +417,7 @@ def post_forecast(req: SpotRequest):
 
 
 @app.get("/forecast/{island_key}", response_model=ForecastResponse)
-def get_island_forecast(island_key: str, days: int = Query(3, ge=1, le=6), spot: Optional[str] = None):
+def get_island_forecast(island_key: str, days: int = Query(3, ge=1, le=7), spot: Optional[str] = None):
     return island_forecast(island_key, days=days, spot_key=spot)
 
 
@@ -412,6 +437,12 @@ def get_swell_map(island_key: str):
         return swellmap.fetch_swell_grid(island_key)
     except UpstreamError as e:
         raise HTTPException(status_code=502, detail=f"Open-Meteo: {e}")
+
+
+@app.post("/esp", response_model=EspResponse)
+def post_esp_forecast(req: SpotRequest, blocks: int = Query(8, ge=1, le=16)):
+    """Same compact device payload as /esp/{island}, for any spot profile (same body as POST /forecast)."""
+    return esp_for_spot(req, blocks=blocks)
 
 
 @app.get("/islands")

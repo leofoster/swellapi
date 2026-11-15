@@ -17,6 +17,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
+from zoneinfo import ZoneInfo
 import statistics
 
 # ─────────────────────────────────────────────────────────────────
@@ -157,7 +158,7 @@ ISLANDS: dict[str, tuple[Island, dict[str, SpotConfig]]] = {
 # ─────────────────────────────────────────────────────────────────
 
 _session = requests.Session()
-_cache: dict[tuple, tuple[float, list]] = {}
+_cache: dict[tuple, tuple[float, list, str]] = {}
 _cache_lock = threading.Lock()
 FORECAST_DAYS = 7   # always fetch the full window; callers slice, so one cache entry serves all
 
@@ -177,21 +178,22 @@ def _get_json(url: str, params: dict, label: str) -> dict:
     return body
 
 
-def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
-    """Hourly marine + wind data for the next FORECAST_DAYS days.
+def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
+    """Hourly marine + wind data for the next FORECAST_DAYS days, plus the
+    location's IANA timezone as Open-Meteo resolves it (e.g. "Atlantic/Bermuda";
+    open-ocean points can come back as "GMT").
 
-    Times are returned as timezone-aware UTC ISO strings, so callers never have
-    to guess what zone a naive timestamp was in. Raises UpstreamError.
-    Results are cached for OPEN_METEO_CACHE_TTL seconds per location.
+    Row times are timezone-aware UTC ISO strings. Raises UpstreamError.
+    Cached for OPEN_METEO_CACHE_TTL seconds per location.
     """
     key = (round(lat, 3), round(lon, 3))
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < OPEN_METEO_CACHE_TTL:
-            return hit[1]
+            return hit[1], hit[2]
 
-    common = {"latitude": lat, "longitude": lon, "timezone": "GMT", "forecast_days": FORECAST_DAYS}
+    common = {"latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": FORECAST_DAYS}
     marine = _get_json(MARINE_URL, {**common, "hourly": [
         "wave_height", "wave_direction", "wave_period", "swell_wave_height",
         "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
@@ -200,6 +202,15 @@ def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
     weather = _get_json(WEATHER_URL, {**common, "wind_speed_unit": "mph",
         "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]}, "weather")
 
+    tz_name = weather.get("timezone") or marine.get("timezone") or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz_name, tz = "UTC", timezone.utc
+
+    def to_utc(t: str) -> str:
+        return datetime.fromisoformat(t).replace(tzinfo=tz).astimezone(timezone.utc).isoformat()
+
     mh, wh = marine["hourly"], weather["hourly"]
     # Align on timestamp rather than index, in case the two models differ in length.
     w_idx = {t: i for i, t in enumerate(wh["time"])}
@@ -207,7 +218,7 @@ def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
     for i, t in enumerate(mh["time"]):
         j = w_idx.get(t)
         rows.append({
-            "time":                datetime.fromisoformat(t).replace(tzinfo=timezone.utc).isoformat(),
+            "time":                to_utc(t),
             "swell_height_m":      mh["swell_wave_height"][i],
             "swell_direction_deg": mh["swell_wave_direction"][i],
             "swell_period_s":      mh["swell_wave_period"][i],
@@ -221,8 +232,13 @@ def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
         })
 
     with _cache_lock:
-        _cache[key] = (now, rows)
-    return rows
+        _cache[key] = (now, rows, tz_name)
+    return rows, tz_name
+
+
+def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
+    """Rows only. See fetch_forecast."""
+    return fetch_forecast(lat, lon)[0]
 
 
 def get_tides(lat: float, lon: float, days: int, now: datetime) -> Optional[dict]:
@@ -423,7 +439,8 @@ def score_tide(tide_height: float, tide_status: str, spot: SpotConfig) -> float:
     # Assuming standard 0.5 to 3.5m range for normalization 
     norm = min(max((tide_height - 0.5) / 3.0, 0.0), 1.0) 
     
-    level_map = {"low": 0.0, "low-mid": 0.25, "mid": 0.5, "mid-high": 0.75, "high": 1.0}
+    level_map = {"low": 0.0, "low-mid": 0.25, "mid-low": 0.25, "mid": 0.5,
+                 "mid-high": 0.75, "high-mid": 0.75, "high": 1.0}
     
     if spot.tide_level_ideal in level_map:
         ideal_norm = level_map[spot.tide_level_ideal]
@@ -464,6 +481,8 @@ def infer_spot(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
         "beach": {"dir": 0.30, "period": 0.25, "height": 0.25, "wind": 0.20},
         "reef":  {"dir": 0.25, "period": 0.35, "height": 0.20, "wind": 0.20},
         "point": {"dir": 0.35, "period": 0.30, "height": 0.20, "wind": 0.15},
+        # Sandbar-dependent like a beach, but more period-sensitive. Assumed weights.
+        "rivermouth": {"dir": 0.30, "period": 0.30, "height": 0.20, "wind": 0.20},
     }
     w = weights.get(spot.break_type, weights["beach"])
     overall = (s_dir * w["dir"] + s_period * w["period"] + s_height * w["height"] + s_wind * w["wind"])
@@ -493,6 +512,17 @@ def infer_spot(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
         "score_overall":      overall,
         "quality":            quality,
     }
+
+
+# Lowercase quality scale for app clients. Same 0.30/0.50/0.70/0.85 cut points as
+# infer_spot's labels, with in-between steps. Matches the keys the web app uses
+# (poor, fair_to_good, epic, ...); the full key set there is unverified.
+QUALITY_KEYS = [(0.85, "epic"), (0.70, "good"), (0.60, "fair_to_good"), (0.50, "fair"),
+                (0.40, "poor_to_fair"), (0.30, "poor"), (0.00, "flat")]
+
+
+def quality_key(score: float) -> str:
+    return next(k for t, k in QUALITY_KEYS if score >= t)
 
 
 def deg_to_compass(deg: Optional[float]) -> str:

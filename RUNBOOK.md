@@ -64,12 +64,14 @@ default setup.
 
 ## Swell map (big-screen proof of concept)
 
-The hourly build also writes `site/map/<island>.json`: swell height, direction
-and period on a ~1.5 degree grid for the next 12 hours, from one Open-Meteo
-request (land comes back null and doubles as the coastline). The simulator's
-**Swell map** button (or `m`) animates it: colour = height, particles move the
-way the swell travels, faster for longer periods, looping over the next 3 hours.
-Map failures are logged in `status.json` (`map_failed`) but never fail the build.
+The hourly build writes `site/map/<island>.json`: swell height, direction and
+period on a ~1.5 degree grid, one frame every 3 hours for the next 48, from one
+Open-Meteo request (land comes back null and doubles as the coastline). The
+simulator's **Swell map** button (or `m`) draws it the way
+`scripts/ocean_swell_map.py` does: streamlines along the swell crests, coloured
+and thickened by height on one scale for all frames, stepping every 3 or 6
+hours ("Map step"). Map failures are logged in `status.json` (`map_failed`)
+but never fail the build.
 
 The readout is offshore swell. The OLED shows what reaches the chosen spot after
 shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
@@ -80,7 +82,8 @@ Unverified: Open-Meteo may count each grid point against the daily quota
 
 ## Not yet true
 
-- Tides: `fetch_mock_tides` is synthetic. It is off unless `MOCK_TIDES=1`, and
+- Tides: `fetch_mock_tides` is synthetic (highs are always 3.5m). The web app's
+  tide display was showing this mock data before it was switched off. It is off unless `MOCK_TIDES=1`, and
   never affects ratings by default.
 - Buoy data (NDBC) is fetched by nothing; confidence is model-only.
 - Firmware v2 has not been compiled or run on hardware yet. The simulator has.
