@@ -433,6 +433,9 @@ def get_swell_map(island_key: str):
     import swellmap
     if island_key not in swellmap.MAP_REGIONS:
         raise HTTPException(status_code=404, detail=f"No map region. Available: {list(swellmap.MAP_REGIONS)}")
+    if island_key == "global":
+        raise HTTPException(status_code=404, detail="Global map is published statically only (map/global.json); "
+                                                    "it costs ~470 Open-Meteo calls to build.")
     try:
         return swellmap.fetch_swell_grid(island_key)
     except UpstreamError as e:

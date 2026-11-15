@@ -64,21 +64,37 @@ default setup.
 
 ## Swell map (big-screen proof of concept)
 
-The hourly build writes `site/map/<island>.json`: swell height, direction and
-period on a ~1.5 degree grid, one frame every 3 hours for the next 48, from one
-Open-Meteo request (land comes back null and doubles as the coastline). The
-simulator's **Swell map** button (or `m`) draws it the way
-`scripts/ocean_swell_map.py` does: streamlines along the swell crests, coloured
-and thickened by height on one scale for all frames, stepping every 3 or 6
-hours ("Map step"). Map failures are logged in `status.json` (`map_failed`)
-but never fail the build.
+The build writes `site/map/<region>.json` for `bermuda`, `newquay` and `global`:
+swell height, direction and period on a coarse grid (2 degrees local, 10 degrees
+global), one frame every 3 hours for 48 hours. The map is stylised; it only
+needs to show a system coming. Maps rebuild every 6 hours (UTC 00/06/12/18) and
+off-cycle runs re-publish the previous copy (`SITE_URL` in the workflow).
+
+Open-Meteo counts every grid point as one call (confirmed by hitting the
+600/minute limit). Cost: ~670 calls per map rebuild, ~2,700 a day. Free tier
+allows 10,000 a day.
+
+The simulator's **Swell map** button (or `m`) draws it like
+`scripts/ocean_swell_map.py`: streamlines along the swell crests, coloured and
+thickened by height. Coastline is Natural Earth land as one outline (110m
+global, 50m local), loaded from the jsDelivr CDN, and lines are clipped to it.
+Map failures are logged in `status.json` (`map_failed`) and never fail the build.
+
+### Tweaking it
+
+```bash
+.venv/bin/python scripts/dev_server.py            # http://localhost:8090/sim/
+.venv/bin/python scripts/dev_server.py --refresh  # re-fetch data first
+```
+
+`/sim/` is served straight from `simulator/`, so code edits show on refresh.
+The **Map tuning** panel (visible while the map is on) changes line direction,
+density, step size, line lengths, seeding, interpolation, coast reach, widths,
+colours, colour scale, land style and timing live. "Copy settings" gives JSON
+to paste into `MAP_DEFAULTS` in `simulator/index.html` to make it the default.
 
 The readout is offshore swell. The OLED shows what reaches the chosen spot after
 shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
-
-Unverified: Open-Meteo may count each grid point against the daily quota
-(~230 points per island per hour). If the build starts seeing 429s, coarsen
-`MAP_REGIONS` in `swellmap.py` or build maps less often.
 
 ## Not yet true
 
