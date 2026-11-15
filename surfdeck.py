@@ -27,11 +27,18 @@ import statistics
 # shares outbound IPs with other customers, so that budget is often gone
 # before we use it (429 "Daily API request limit exceeded").
 #
-# The primary deployment is now scripts/build_static.py on a GitHub Actions
-# schedule (see RUNBOOK.md), which makes ~4 calls an hour. This module still
-# supports an optional relay (api_prox.py) via OPEN_METEO_PROXY for anyone
-# running the live API somewhere with a shared IP.
+# Optional relay (api_prox.py on a home connection, exposed by a tunnel):
+#   OPEN_METEO_PROXY  fixed relay base URL (simple; local dev uses this)
+#   RELAY_CONFIG_URL  URL of a small JSON switch, {"enabled": bool, "url": "..."},
+#                     re-read every RELAY_CONFIG_TTL seconds. scripts/relay.py keeps
+#                     it current in a GitHub gist, so the relay can be turned on/off
+#                     (and its tunnel URL can change) without touching Render.
+#   PROXY_TOKEN       shared secret the relay requires (X-Proxy-Token)
+# If the relay fails, requests fall back to calling Open-Meteo directly.
 OPEN_METEO_PROXY   = os.environ.get("OPEN_METEO_PROXY", "").rstrip("/")
+RELAY_CONFIG_URL   = os.environ.get("RELAY_CONFIG_URL", "")
+RELAY_CONFIG_TTL   = float(os.environ.get("RELAY_CONFIG_TTL", "60"))
+PROXY_TOKEN        = os.environ.get("PROXY_TOKEN", "")
 OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
 # Open-Meteo refreshes hourly, so re-asking more often only burns the quota.
 OPEN_METEO_CACHE_TTL = float(os.environ.get("OPEN_METEO_CACHE_TTL", "1800"))
@@ -39,22 +46,13 @@ OPEN_METEO_CACHE_TTL = float(os.environ.get("OPEN_METEO_CACHE_TTL", "1800"))
 # fake data never moves real ratings.
 MOCK_TIDES = os.environ.get("MOCK_TIDES", "") == "1"
 
+DIRECT_URLS = {"marine": "https://marine-api.open-meteo.com/v1/marine",
+               "weather": "https://api.open-meteo.com/v1/forecast"}
+RELAY_PATHS = {"marine": "/marine", "weather": "/forecast"}
+
 
 class UpstreamError(RuntimeError):
     """Open-Meteo could not be reached or refused the request. Message is the reason."""
-
-MARINE_URL  = f"{OPEN_METEO_PROXY}/marine"   if OPEN_METEO_PROXY else "https://marine-api.open-meteo.com/v1/marine"
-WEATHER_URL = f"{OPEN_METEO_PROXY}/forecast" if OPEN_METEO_PROXY else "https://api.open-meteo.com/v1/forecast"
-
-_PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "")
-_PROXY_HEADERS: dict[str, str] = {}
-if OPEN_METEO_PROXY:
-    # Shared secret, so a public tunnel is not an open relay.
-    if _PROXY_TOKEN:
-        _PROXY_HEADERS["X-Proxy-Token"] = _PROXY_TOKEN
-    # ngrok's free tier can answer with an HTML interstitial instead of the
-    # JSON body, which would fail to parse. This header opts out of it.
-    _PROXY_HEADERS["ngrok-skip-browser-warning"] = "true"
 
 
 def safe_mean(values: list) -> Optional[float]:
@@ -163,18 +161,65 @@ _cache_lock = threading.Lock()
 FORECAST_DAYS = 7   # always fetch the full window; callers slice, so one cache entry serves all
 
 
-def _get_json(url: str, params: dict, label: str) -> dict:
+_relay = {"checked": -1e9, "url": None}
+_relay_lock = threading.Lock()
+
+
+def relay_base() -> Optional[str]:
+    """Current relay base URL, or None for direct. Reads the switch at most every RELAY_CONFIG_TTL s;
+    if the switch can't be read, keeps the last known answer."""
+    if OPEN_METEO_PROXY:
+        return OPEN_METEO_PROXY
+    if not RELAY_CONFIG_URL:
+        return None
+    with _relay_lock:
+        if time.monotonic() - _relay["checked"] < RELAY_CONFIG_TTL:
+            return _relay["url"]
+        try:
+            cfg = _session.get(RELAY_CONFIG_URL, timeout=5).json()
+            url = (cfg.get("url") or "").rstrip("/") if cfg.get("enabled") else ""
+            _relay["url"] = url or None
+        except Exception:
+            pass
+        _relay["checked"] = time.monotonic()
+        return _relay["url"]
+
+
+def _request(url: str, params: dict, label: str, headers: dict, timeout: float):
     try:
-        resp = _session.get(url, params=params, headers=_PROXY_HEADERS, timeout=OPEN_METEO_TIMEOUT)
+        resp = _session.get(url, params=params, headers=headers, timeout=timeout)
     except requests.RequestException as e:
         raise UpstreamError(f"{label}: {type(e).__name__}: {e}") from e
     try:
         body = resp.json()
     except ValueError:
         raise UpstreamError(f"{label}: HTTP {resp.status_code}, non-JSON body: {resp.text[:120]!r}")
-    if resp.status_code != 200 or body.get("error") or "hourly" not in body:
-        reason = body.get("reason") or "no hourly data (no model coverage here?)"
-        raise UpstreamError(f"{label}: HTTP {resp.status_code}: {reason}")
+    if resp.status_code != 200 or (isinstance(body, dict) and body.get("error")):
+        reason = body.get("reason") if isinstance(body, dict) else None
+        raise UpstreamError(f"{label}: HTTP {resp.status_code}: {reason or 'error'}")
+    return body
+
+
+def om_get(kind: str, params: dict, label: str, timeout: Optional[float] = None):
+    """GET an Open-Meteo API ("marine" or "weather"), via the relay when it is on.
+    Any relay failure falls back to a direct call. Returns parsed JSON; raises UpstreamError."""
+    timeout = timeout or OPEN_METEO_TIMEOUT
+    base = relay_base()
+    if base:
+        headers = {"ngrok-skip-browser-warning": "true"}
+        if PROXY_TOKEN:
+            headers["X-Proxy-Token"] = PROXY_TOKEN
+        try:
+            return _request(base + RELAY_PATHS[kind], params, f"{label} (relay)", headers, timeout)
+        except UpstreamError as e:
+            print(f"  relay failed, going direct: {e}")
+    return _request(DIRECT_URLS[kind], params, label, {}, timeout)
+
+
+def _get_json(kind: str, params: dict, label: str) -> dict:
+    body = om_get(kind, params, label)
+    if not isinstance(body, dict) or "hourly" not in body:
+        raise UpstreamError(f"{label}: no hourly data (no model coverage here?)")
     return body
 
 
@@ -194,12 +239,12 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
             return hit[1], hit[2]
 
     common = {"latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": FORECAST_DAYS}
-    marine = _get_json(MARINE_URL, {**common, "hourly": [
+    marine = _get_json("marine", {**common, "hourly": [
         "wave_height", "wave_direction", "wave_period", "swell_wave_height",
         "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
         "wind_wave_height", "wind_wave_period",
     ]}, "marine")
-    weather = _get_json(WEATHER_URL, {**common, "wind_speed_unit": "mph",
+    weather = _get_json("weather", {**common, "wind_speed_unit": "mph",
         "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]}, "weather")
 
     tz_name = weather.get("timezone") or marine.get("timezone") or "UTC"

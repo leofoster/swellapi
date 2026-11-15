@@ -457,22 +457,16 @@ def list_islands():
 
 @app.get("/debug/upstream")
 def debug_upstream(lat: float = 32.30, lon: float = -64.80):
-    """What Open-Meteo says from this server, over the same route the app uses
-    (direct, or via OPEN_METEO_PROXY when set)."""
-    out = {"route": surfdeck.OPEN_METEO_PROXY or "direct"}
-    for name, url, extra in [("marine", surfdeck.MARINE_URL, {"hourly": "swell_wave_height"}),
-                             ("weather", surfdeck.WEATHER_URL, {"hourly": "wind_speed_10m"})]:
+    """What Open-Meteo says from this server, over the route the app is using right now
+    (relay when switched on, else direct; relay failures fall back to direct)."""
+    out = {"route": surfdeck.relay_base() or "direct",
+           "relay_switch": "configured" if surfdeck.RELAY_CONFIG_URL else ("fixed" if surfdeck.OPEN_METEO_PROXY else "none")}
+    for name, extra in [("marine", {"hourly": "swell_wave_height"}), ("weather", {"hourly": "wind_speed_10m"})]:
         try:
-            r = surfdeck._session.get(url, params={"latitude": lat, "longitude": lon, "forecast_days": 1, **extra},
-                                      headers=surfdeck._PROXY_HEADERS, timeout=10)
-            try:
-                body = r.json()
-            except ValueError:
-                body = {}
-            out[name] = {"status": r.status_code, "reason": body.get("reason"),
-                         "has_hourly": "hourly" in body, "snippet": r.text[:200]}
-        except Exception as e:
-            out[name] = {"status": None, "exception": f"{type(e).__name__}: {e}"}
+            body = surfdeck.om_get(name, {"latitude": lat, "longitude": lon, "forecast_days": 1, **extra}, name, timeout=10)
+            out[name] = {"status": 200, "has_hourly": "hourly" in body}
+        except surfdeck.UpstreamError as e:
+            out[name] = {"status": "error", "reason": str(e)}
     return out
 
 

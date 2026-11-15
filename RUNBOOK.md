@@ -57,10 +57,9 @@ activity. Re-enable from the Actions tab.
 **Schedule drift.** GitHub can delay cron runs by several minutes or skip one
 under load. Data covers 48h, so a missed hour is invisible.
 
-**Render (optional live API).** Same shared-IP 429 problem, plus a 30-60s cold
-start. `/debug/upstream` shows what Open-Meteo says over the route the app
-actually uses. `api_prox.py` is the old home-PC relay; it is not needed for the
-default setup.
+**Render (live API for the web app).** Shared-IP 429s (see "Home relay") plus
+a 30-60s cold start. `/debug/upstream` shows the route in use and what
+Open-Meteo says over it.
 
 ## Swell map (big-screen proof of concept)
 
@@ -95,6 +94,30 @@ to paste into `MAP_DEFAULTS` in `simulator/index.html` to make it the default.
 
 The readout is offshore swell. The OLED shows what reaches the chosen spot after
 shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
+
+## Home relay (temporary fix for 429s on Render)
+
+Render's shared IP runs out of Open-Meteo's free quota. Until there is an API
+key, the website's API can borrow your home connection:
+
+```bash
+python scripts/relay.py setup    # once: creates the switch (a secret gist), prints Render settings
+python scripts/relay.py on       # relay + Cloudflare tunnel + keep-awake; switch ON
+python scripts/relay.py status
+python scripts/relay.py off      # switch OFF, stop everything
+```
+
+- Render needs two env vars, set once: `RELAY_CONFIG_URL` (printed by
+  `setup`) and `PROXY_TOKEN` (from `.proxy.env`). Remove `OPEN_METEO_PROXY`.
+- The API reads the switch every minute. GitHub caches raw gists for a few
+  minutes, so on/off takes up to ~5 min to land.
+- You can flip `"enabled"` by editing the gist on github.com.
+- If the relay is unreachable (Mac asleep, tunnel restarted), the API falls
+  back to calling Open-Meteo directly, so the worst case is today's behaviour.
+- `scripts/dev_server.py` uses the local relay automatically when it is up,
+  so experiments share its 30-minute cache.
+- Everything shares your home IP's 10,000 calls/day. The real fix is an
+  Open-Meteo API key.
 
 ## Not yet true
 

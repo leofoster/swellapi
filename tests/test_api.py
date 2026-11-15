@@ -147,3 +147,34 @@ def test_post_esp_for_saved_spot(monkeypatch):
     assert r.status_code == 200, r.text
     d = r.json()
     assert d["s"] == "My Reef" and len(d["b"]) == 4 and "e" in d["b"][0]
+
+
+def test_relay_switch_and_fallback(monkeypatch):
+    calls = []
+
+    class R:
+        def __init__(self, code, body): self.status_code, self._b, self.text = code, body, ""
+        def json(self): return self._b
+
+    switch = {"enabled": True, "url": "https://relay.example/"}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(url)
+        if url == "https://switch.example/relay.json":
+            return R(200, switch)
+        if url.startswith("https://relay.example"):
+            raise surfdeck.requests.ConnectionError("relay down")
+        return R(200, {"hourly": {}})
+
+    monkeypatch.setattr(surfdeck, "RELAY_CONFIG_URL", "https://switch.example/relay.json")
+    monkeypatch.setattr(surfdeck, "RELAY_CONFIG_TTL", 0)
+    monkeypatch.setattr(surfdeck, "OPEN_METEO_PROXY", "")
+    monkeypatch.setattr(surfdeck._session, "get", fake_get)
+
+    assert surfdeck.relay_base() == "https://relay.example"
+    assert surfdeck.om_get("weather", {}, "t") == {"hourly": {}}        # relay down -> direct
+    assert calls[-2].startswith("https://relay.example/forecast")
+    assert calls[-1] == surfdeck.DIRECT_URLS["weather"]
+
+    switch["enabled"] = False
+    assert surfdeck.relay_base() is None

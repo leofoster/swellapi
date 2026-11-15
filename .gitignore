@@ -8,3 +8,4 @@ site/
 CLAUDE.local.md
 .proxy.env
 .tunnel-url
+.relay/

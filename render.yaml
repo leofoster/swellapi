@@ -15,8 +15,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
-      # Optional relay through api_prox.py. Leave unset to call Open-Meteo directly.
-      - key: OPEN_METEO_PROXY
+      # Optional home relay (api_prox.py), switched on/off by `scripts/relay.py`.
+      # RELAY_CONFIG_URL = raw URL of the switch gist (printed by `relay.py setup`).
+      # PROXY_TOKEN      = value from .proxy.env on the relay machine.
+      # Leave both unset to call Open-Meteo directly.
+      - key: RELAY_CONFIG_URL
         sync: false
       - key: PROXY_TOKEN
         sync: false

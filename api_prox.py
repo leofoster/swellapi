@@ -1,8 +1,8 @@
 # api_prox.py — residential proxy for Open-Meteo (LEGACY / optional)
 #
-# No longer needed for the default setup: the GitHub Actions + Pages build
-# (scripts/build_static.py) calls Open-Meteo directly. Kept for anyone running
-# the live API on a host whose shared IP is rate limited.
+# Not needed by the static GitHub Pages build. Used by the live API on Render,
+# whose shared IP is rate limited. Start and stop it with scripts/relay.py,
+# which also opens the tunnel and flips the switch Render reads.
 #
 # Open-Meteo's free tier rejects calls from Render's shared datacenter IPs, so
 # the deployed API routes its upstream requests through this process running on

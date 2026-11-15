@@ -36,23 +36,16 @@ def _frange(a: float, b: float, step: float) -> list[float]:
 
 
 def _fetch_batch(pts: list[tuple[float, float]], hours: int) -> list[dict]:
-    try:
-        resp = surfdeck._session.get(surfdeck.MARINE_URL, params={
-            "latitude":  ",".join(str(la) for la, _ in pts),
-            "longitude": ",".join(str(lo) for _, lo in pts),
-            "hourly": "swell_wave_height,swell_wave_direction,swell_wave_period",
-            "forecast_hours": hours + 1, "timezone": "GMT", "cell_selection": "nearest",
-        }, headers=surfdeck._PROXY_HEADERS, timeout=max(surfdeck.OPEN_METEO_TIMEOUT, 60))
-        body = resp.json()
-    except Exception as e:
-        raise UpstreamError(f"map: {type(e).__name__}: {e}") from e
-    if len(pts) == 1 and isinstance(body, dict) and "hourly" in body:
+    body = surfdeck.om_get("marine", {
+        "latitude":  ",".join(str(la) for la, _ in pts),
+        "longitude": ",".join(str(lo) for _, lo in pts),
+        "hourly": "swell_wave_height,swell_wave_direction,swell_wave_period",
+        "forecast_hours": hours + 1, "timezone": "GMT", "cell_selection": "nearest",
+    }, "map", timeout=max(surfdeck.OPEN_METEO_TIMEOUT, 60))
+    if isinstance(body, dict) and "hourly" in body:
         body = [body]                       # single location comes back as an object
-    if resp.status_code != 200 or not isinstance(body, list):
-        reason = body.get("reason") if isinstance(body, dict) else None
-        raise UpstreamError(f"map: HTTP {resp.status_code}: {reason}")
-    if len(body) != len(pts):
-        raise UpstreamError(f"map: expected {len(pts)} points, got {len(body)}")
+    if not isinstance(body, list) or len(body) != len(pts):
+        raise UpstreamError(f"map: expected {len(pts)} points, got {len(body) if isinstance(body, list) else 'an object'}")
     return body
 
 
