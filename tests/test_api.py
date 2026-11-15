@@ -24,7 +24,7 @@ def fake_forecast(lat, lon, start=None):
 
 @pytest.fixture(autouse=True)
 def stub_upstream(monkeypatch):
-    monkeypatch.setattr(api, "fetch_open_meteo", fake_forecast)
+    monkeypatch.setattr(api, "fetch_forecast", lambda lat, lon: (fake_forecast(lat, lon), "Atlantic/Bermuda"))
 
 
 def test_esp_blocks_use_local_labels_and_epochs():
@@ -63,7 +63,7 @@ def test_mock_tides_off_by_default():
 
 def test_http_endpoints(monkeypatch):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-    monkeypatch.setattr(api, "fetch_open_meteo", lambda lat, lon: fake_forecast(lat, lon, today))
+    monkeypatch.setattr(api, "fetch_forecast", lambda lat, lon: (fake_forecast(lat, lon, today), "Atlantic/Bermuda"))
     c = TestClient(api.app)
     assert c.get("/health").status_code == 200
     assert c.get("/esp/bermuda?blocks=2").json()["v"] == 2
@@ -75,7 +75,7 @@ def test_http_endpoints(monkeypatch):
 def test_upstream_error_is_502_with_reason(monkeypatch):
     def boom(lat, lon):
         raise surfdeck.UpstreamError("weather: HTTP 429: Daily API request limit exceeded")
-    monkeypatch.setattr(api, "fetch_open_meteo", boom)
+    monkeypatch.setattr(api, "fetch_forecast", boom)
     r = TestClient(api.app).get("/esp/bermuda")
     assert r.status_code == 502
     assert "429" in r.json()["detail"]
@@ -88,10 +88,10 @@ def test_map_grid_parsing(monkeypatch):
         status_code = 200
         def __init__(self, n): self.n = n
         def json(self):
-            return [{"hourly": {"time": ["2026-07-01T00:00", "2026-07-01T01:00"],
-                                "swell_wave_height": [None, None] if k == 0 else [1.234, 1.5],
-                                "swell_wave_direction": [None, None] if k == 0 else [350.4, 10],
-                                "swell_wave_period": [None, None] if k == 0 else [9.04, 9]}}
+            return [{"hourly": {"time": [f"2026-07-01T{h:02d}:00" for h in range(4)],
+                                "swell_wave_height": [None] * 4 if k == 0 else [1.234, 1.5, 1.6, 1.7],
+                                "swell_wave_direction": [None] * 4 if k == 0 else [350.4, 10, 20, 30],
+                                "swell_wave_period": [None] * 4 if k == 0 else [9.04, 9, 9, 9]}}
                     for k in range(self.n)]
 
     region = swellmap.MAP_REGIONS["bermuda"]
@@ -99,7 +99,51 @@ def test_map_grid_parsing(monkeypatch):
     nx = len(swellmap._frange(*region["lon"], region["step"]))
     monkeypatch.setattr(swellmap.surfdeck._session, "get", lambda *a, **k: Resp(nx * ny))
     g = swellmap.fetch_swell_grid("bermuda")
-    assert len(g["h"]) == 2 and len(g["h"][0]) == ny and len(g["h"][0][0]) == nx
+    assert len(g["h"]) == 2 and g["step_h"] == 3 and len(g["h"][0]) == ny and len(g["h"][0][0]) == nx
     assert g["h"][0][0][0] is None            # first point is land
     assert g["h"][0][0][1] == 1.23 and g["d"][0][0][1] == 350
-    assert g["times"][1] - g["times"][0] == 3600
+    assert g["times"][1] - g["times"][0] == 3 * 3600         # 3-hourly frames
+    assert g["h"][1][0][1] == 1.7
+
+
+APP_BODY = {   # shape the Base44 web app sends
+    "spot_name": "My Reef", "lat": 32.3, "lon": -64.8,
+    "swell_dir_min": 135, "swell_dir_max": 260, "swell_dir_ideal": 180,
+    "swell_period_min": 10, "swell_period_ideal": 16,
+    "swell_height_min": 0.8, "swell_height_ideal": 2, "swell_height_max": 4.5,
+    "wind_offshore_min": 315, "wind_offshore_max": 60, "wind_speed_max": 20,
+    "break_type": "rivermouth", "exposure": 1, "shadow_zones": [], "wrap_factor": 0,
+    "days": 7, "timezone": "auto", "tide_level_ideal": "mid-low", "tide_movement_ideal": "rising",
+}
+
+
+def _client_now(monkeypatch):
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    monkeypatch.setattr(api, "fetch_forecast", lambda lat, lon: (fake_forecast(lat, lon, today), "Atlantic/Bermuda"))
+    return TestClient(api.app)
+
+
+def test_web_app_request_shape(monkeypatch):
+    r = _client_now(monkeypatch).post("/forecast", json=APP_BODY)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["timezone"] == "Atlantic/Bermuda"          # "auto" resolved to the spot's zone
+    assert len(d["days"]) == 7
+    day, hour = d["days"][0], d["days"][0]["hours"][0]
+    assert day["quality_key"] in ("flat", "poor", "poor_to_fair", "fair", "fair_to_good", "good", "epic")
+    assert hour["quality_key"] == hour["quality_key"].lower()
+    assert hour["tide_height_m"] is None and day["high_tides"] == []   # no tide data, still 200
+
+
+def test_tide_failure_does_not_fail_forecast(monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError("tide provider down")
+    monkeypatch.setattr(api, "get_tides", broken)
+    assert _client_now(monkeypatch).post("/forecast", json=APP_BODY).status_code == 200
+
+
+def test_post_esp_for_saved_spot(monkeypatch):
+    r = _client_now(monkeypatch).post("/esp?blocks=4", json=APP_BODY)
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["s"] == "My Reef" and len(d["b"]) == 4 and "e" in d["b"][0]
