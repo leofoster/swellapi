@@ -45,6 +45,21 @@
   .faults { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   pre#serial { margin: 0; height: 220px; overflow: auto; background: #07090c; color: #9fe7a8; border-radius: 6px; padding: 10px;
                font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .screen { position: relative; width: min(820px, 100%); aspect-ratio: 5 / 3; background: #000; border-radius: 10px;
+            box-shadow: 0 0 0 10px #0a0c10, 0 10px 40px rgba(0,0,0,.45); overflow: hidden; }
+  .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .screen .hud { position: absolute; left: 0; right: 0; top: 0; display: flex; justify-content: space-between; align-items: baseline;
+                 padding: 12px 16px; color: #eaf3ff; font-weight: 600; letter-spacing: .04em; pointer-events: none;
+                 background: linear-gradient(#000a, #0000); font-size: clamp(11px, 2.2vw, 16px); }
+  .screen .hud small { font-weight: 500; opacity: .8; letter-spacing: 0; }
+  .screen .foot { position: absolute; left: 16px; right: 16px; bottom: 12px; display: flex; gap: 14px; align-items: center;
+                  color: #eaf3ff; font-size: clamp(10px, 1.8vw, 13px); pointer-events: none; }
+  .ramp { width: 140px; height: 8px; border-radius: 4px; flex: none;
+          background: linear-gradient(90deg, #0b1d3a, #1b5f8c 25%, #2bb3a3 50%, #f2d16b 75%, #f2784b); }
+  .progress { flex: 1; height: 3px; background: #ffffff30; border-radius: 2px; overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: #eaf3ff; }
+  .hidden { display: none !important; }
+  button.active { border-color: var(--accent); color: var(--accent); }
   .full { grid-column: 1 / -1; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -63,18 +78,25 @@
 
 <main>
   <section class="card device">
-    <div class="pcb"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
+    <div class="pcb" id="oledView"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
+    <div class="screen hidden" id="mapView">
+      <canvas id="mapField"></canvas><canvas id="mapFlow"></canvas>
+      <div class="hud"><span id="mapTitle">SWELL</span><small id="mapTime"></small></div>
+      <div class="foot"><span>0 m</span><span class="ramp"></span><span>4 m+</span>
+        <span id="mapHere"></span><span class="progress"><i id="mapProg"></i></span></div>
+    </div>
     <div class="status-row">
       <span class="pill" id="pWifi">wifi</span>
       <span class="pill" id="pData">no data</span>
       <span class="pill" id="pNext">next poll</span>
       <span class="pill" id="pClock">clock</span>
     </div>
-    <div class="row" style="width:100%;max-width:560px">
+    <div class="row" style="width:100%;max-width:600px">
       <button id="bPrev">◀ Prev</button>
       <button id="bPoll">Poll now</button>
       <button id="bNext">Next ▶</button>
       <button id="bReset">Reboot</button>
+      <button id="bMap">Swell map</button>
     </div>
   </section>
 
@@ -189,10 +211,10 @@ const MAX_BLOCKS = 16;
 
 function layout(height) {
   return height >= 64
-    ? { Y_QUALITY: 0, Y_TAG: 0, Y_TIME: 8, Y_RULE: 17, Y_BIG: 21, Y_DET: 25, Y_WIND: 40, Y_BAR: 54, BAR_H: 8, COMPACT: false }
-    : { Y_QUALITY: 0, Y_TAG: 0, Y_TIME: 8, Y_RULE: 15, Y_BIG: 16, Y_DET: 16, Y_WIND: 24, Y_BAR: 0, BAR_H: 0, COMPACT: true };
+    ? { Y_NAME: 0, Y_TIME: 8, Y_RULE: 16, Y_QUALITY: 18, Y_BIG: 36, Y_DET: 36, Y_WIND: 44, Y_BAR: 55, BAR_H: 8, COMPACT: false }
+    : { Y_NAME: 0, Y_TIME: 8, Y_RULE: 0, Y_QUALITY: 8, Y_BIG: 16, Y_DET: 16, Y_WIND: 24, Y_BAR: 0, BAR_H: 0, COMPACT: true };
 }
-const X_RIGHT = 86, X_DET = 56, X_WARN = 122;
+const X_TAG = 92, X_TIME_C = 86, X_DET = 60, X_PCT = 104, X_WARN = 122, NAME_CHARS = 15;
 
 const $ = id => document.getElementById(id);
 const faults = new Set();
@@ -305,26 +327,33 @@ function tagFor(v, now) {
 
 function drawBlock(v, now, warn) {
   display.clearDisplay();
-  display.setTextSize(2); display.setCursor(0, L.Y_QUALITY); display.print(v.quality);
   display.setTextSize(1);
-  display.setCursor(X_RIGHT, L.Y_TAG); display.print(tagFor(v, now));
-  display.setCursor(X_RIGHT, L.Y_TIME); display.print(v.timeLabel);
-  if (warn) { display.setCursor(X_WARN, L.Y_TAG); display.print("!"); }
-  display.drawFastHLine(0, L.Y_RULE, display.w);
+  display.setCursor(0, L.Y_NAME); display.print(dev.spotName.slice(0, NAME_CHARS));
+  display.setCursor(X_TAG, L.Y_NAME); display.print(tagFor(v, now));
+  if (warn) { display.setCursor(X_WARN, L.Y_NAME); display.print("!"); }
 
   if (L.COMPACT) {
+    display.setCursor(0, L.Y_QUALITY); display.print(v.quality);
+    display.setCursor(X_TIME_C, L.Y_TIME); display.print(v.timeLabel);
     display.setCursor(0, L.Y_BIG);
     display.print(`${fmt(v.swellHeight, 1)}m ${fmt(v.swellPeriod, 0)}s ${v.swellDir}`);
     display.setCursor(0, L.Y_WIND);
     display.print(`W ${fmt(v.windSpeed, 0)}mph ${v.windDir}  ${Math.trunc(v.rating * 100)}%`);
-  } else {
-    display.setTextSize(2); display.setCursor(0, L.Y_BIG); display.print(`${fmt(v.swellHeight, 1)}m`);
-    display.setTextSize(1); display.setCursor(X_DET, L.Y_DET); display.print(`${fmt(v.swellPeriod, 0)}s ${v.swellDir}`);
-    display.setCursor(0, L.Y_WIND); display.print(`WND ${fmt(v.windSpeed, 0)}mph ${v.windDir}`);
-    const barW = Math.max(2, Math.min(display.w, Math.trunc(v.rating * display.w)));
-    display.drawRect(0, L.Y_BAR, display.w, L.BAR_H);
-    display.fillRect(0, L.Y_BAR, barW, L.BAR_H);
+    paint(); return;
   }
+
+  display.setCursor(0, L.Y_TIME); display.print(v.timeLabel);
+  display.drawFastHLine(0, L.Y_RULE, display.w);
+  display.setTextSize(2); display.setCursor(0, L.Y_QUALITY); display.print(v.quality);
+  display.setTextSize(1); display.setCursor(X_PCT, L.Y_QUALITY + 4);
+  display.print(`${String(Math.trunc(v.rating * 100)).padStart(3, " ")}%`);
+  display.setTextSize(2); display.setCursor(0, L.Y_BIG); display.print(`${fmt(v.swellHeight, 1)}m`);
+  display.setTextSize(1);
+  display.setCursor(X_DET, L.Y_DET); display.print(`${fmt(v.swellPeriod, 0)}s ${v.swellDir}`);
+  display.setCursor(X_DET, L.Y_WIND); display.print(`${fmt(v.windSpeed, 0)}mph ${v.windDir}`);
+  const barW = Math.max(2, Math.min(display.w, Math.trunc(v.rating * display.w)));
+  display.drawRect(0, L.Y_BAR, display.w, L.BAR_H);
+  display.fillRect(0, L.Y_BAR, barW, L.BAR_H);
   paint();
 }
 
@@ -482,9 +511,167 @@ $("bWarp6").onclick = () => { warpS += 6 * 3600; serial("[sim] clock +6h"); draw
 $("bWarp0").onclick = () => { warpS = 0; serial("[sim] clock reset"); drawPage(); };
 $("sHeight").onchange = () => { persist(); setup(); };
 $("sColor").onchange = () => { persist(); paint(); };
-$("sIsland").onchange = () => { persist(); fillSpots(); setup(); };
+$("sIsland").onchange = () => { persist(); fillSpots(); setup(); map.island = null; if (map.on) toggleMap(true); };
 $("sSpot").onchange = () => setup();
 $("iUrl").onchange = () => { persist(); loadIslands(); setup(); };
+
+/* ───────────────────────── Ambient swell map (big-screen POC) ─────────────────────────
+   Data: <API_URL>/map/<island>.json (static) or /map/<island> (live API).
+   h/d/p grids are [time][lat][lon], null on land. Interpolated in space and time;
+   particles travel the way the swell is going, faster for longer periods. */
+const MAP_LOOP_MS = 16000;            // one pass over the window
+const RAMP = [[0, [11, 29, 58]], [1, [27, 95, 140]], [2, [43, 179, 163]], [3, [242, 209, 107]], [4, [242, 120, 75]]];
+const LAND = [38, 42, 48];
+const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const map = { data: null, on: false, hours: 3, t0: 0, raf: 0, parts: [], lastField: 0, island: null };
+
+function rampColor(h) {
+  if (h >= 4) return RAMP[4][1];
+  for (let i = 1; i < RAMP.length; i++) if (h <= RAMP[i][0]) {
+    const [a, ca] = RAMP[i - 1], [b, cb] = RAMP[i], f = (h - a) / (b - a);
+    return ca.map((c, k) => c + (cb[k] - c) * f);
+  }
+  return RAMP[0][1];
+}
+
+// Value of grid g (one time slice) at fractional cell (fx, fy); null if all corners are land.
+function bilerp(g, fx, fy, angular) {
+  const ny = g.length, nx = g[0].length;
+  const x0 = Math.max(0, Math.min(nx - 1, Math.floor(fx))), y0 = Math.max(0, Math.min(ny - 1, Math.floor(fy)));
+  const x1 = Math.min(nx - 1, x0 + 1), y1 = Math.min(ny - 1, y0 + 1);
+  const tx = fx - x0, ty = fy - y0;
+  let sw = 0, sv = 0, sx = 0, sy = 0;
+  for (const [x, y, w] of [[x0, y0, (1 - tx) * (1 - ty)], [x1, y0, tx * (1 - ty)], [x0, y1, (1 - tx) * ty], [x1, y1, tx * ty]]) {
+    const v = g[y][x]; if (v == null || w <= 0) continue;
+    sw += w;
+    if (angular) { const r = v * Math.PI / 180; sx += Math.cos(r) * w; sy += Math.sin(r) * w; } else sv += v * w;
+  }
+  if (sw < 0.35) return null;                              // mostly land
+  return angular ? (Math.atan2(sy, sx) * 180 / Math.PI + 360) % 360 : sv / sw;
+}
+
+// Sample at lon/lat for absolute time (unix s), blending the two nearest hours.
+function sample(lon, lat, tUnix) {
+  const D = map.data, nx = D.lons.length, ny = D.lats.length;
+  const fx = (lon - D.lons[0]) / (D.lons[nx - 1] - D.lons[0]) * (nx - 1);
+  const fy = (lat - D.lats[0]) / (D.lats[ny - 1] - D.lats[0]) * (ny - 1);
+  const T = D.times, ft = Math.max(0, Math.min(T.length - 1, (tUnix - T[0]) / 3600));
+  const i0 = Math.floor(ft), i1 = Math.min(T.length - 1, i0 + 1), f = ft - i0;
+  const h0 = bilerp(D.h[i0], fx, fy), h1 = bilerp(D.h[i1], fx, fy);
+  if (h0 == null || h1 == null) return null;
+  const p0 = bilerp(D.p[i0], fx, fy) ?? 8, p1 = bilerp(D.p[i1], fx, fy) ?? 8;
+  const d0 = bilerp(D.d[i0], fx, fy, true), d1 = bilerp(D.d[i1], fx, fy, true);
+  let dd = ((d1 - d0 + 540) % 360) - 180;                   // shortest way round
+  return { h: h0 + (h1 - h0) * f, p: p0 + (p1 - p0) * f, d: (d0 + dd * f + 360) % 360 };
+}
+
+function mapCanvases() {
+  const field = $("mapField"), flow = $("mapFlow"), r = $("mapView").getBoundingClientRect();
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
+  if (flow.width !== W || flow.height !== H) { flow.width = W; flow.height = H; map.parts = []; }
+  return { field, flow, W, H };
+}
+// Screen <-> geo: the box spans the grid; simple equirectangular is fine at this scale.
+function toXY(lon, lat, W, H) {
+  const D = map.data;
+  return [(lon - D.lons[0]) / (D.lons.at(-1) - D.lons[0]) * W, (1 - (lat - D.lats[0]) / (D.lats.at(-1) - D.lats[0])) * H];
+}
+function toGeo(x, y, W, H) {
+  const D = map.data;
+  return [D.lons[0] + x / W * (D.lons.at(-1) - D.lons[0]), D.lats[0] + (1 - y / H) * (D.lats.at(-1) - D.lats[0])];
+}
+
+function drawField(tUnix) {
+  const fw = 160, fh = 96, c = $("mapField");          // low-res, browser-smoothed upscale
+  if (c.width !== fw) { c.width = fw; c.height = fh; }
+  const ctx = c.getContext("2d"), img = ctx.createImageData(fw, fh);
+  for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
+    const [lon, lat] = toGeo(x + .5, y + .5, fw, fh);
+    const s = sample(lon, lat, tUnix), col = s ? rampColor(s.h) : LAND, o = (y * fw + x) * 4;
+    img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2]; img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+function spawn(W, H) { return { x: Math.random() * W, y: Math.random() * H, age: Math.random() * 120, life: 80 + Math.random() * 120 }; }
+
+function mapFrame(ts) {
+  if (!map.on || !map.data) return;
+  const { flow, W, H } = mapCanvases(), ctx = flow.getContext("2d");
+  const D = map.data, start = Math.max(D.times[0], Math.floor(Date.now() / 1000 / 3600) * 3600);
+  const span = Math.min(map.hours * 3600, D.times.at(-1) - start);
+  const phase = ((ts - map.t0) % MAP_LOOP_MS) / MAP_LOOP_MS;
+  const tUnix = start + phase * span;
+
+  if (ts - map.lastField > 150) { drawField(tUnix); map.lastField = ts; }
+
+  // Fade old trails, then advance particles
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.fillStyle = "rgba(0,0,0,0.08)"; ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = "source-over";
+  const target = Math.round(W * H / 900);
+  while (map.parts.length < target) map.parts.push(spawn(W, H));
+  ctx.lineWidth = Math.max(1, W / 700); ctx.lineCap = "round";
+  ctx.strokeStyle = "rgba(240,248,255,0.55)";
+  ctx.beginPath();
+  for (const pt of map.parts) {
+    const [lon, lat] = toGeo(pt.x, pt.y, W, H), s = sample(lon, lat, tUnix);
+    if (!s || ++pt.age > pt.life) { Object.assign(pt, spawn(W, H), { age: 0 }); continue; }
+    const go = (s.d + 180) * Math.PI / 180;                  // swell travels away from where it comes from
+    const v = (0.25 + s.p * 0.09) * (W / 800) * (0.6 + Math.min(s.h, 3) / 3);
+    const nx = pt.x + Math.sin(go) * v, ny = pt.y - Math.cos(go) * v;
+    ctx.moveTo(pt.x, pt.y); ctx.lineTo(nx, ny);
+    pt.x = nx; pt.y = ny;
+    if (nx < 0 || ny < 0 || nx > W || ny > H) Object.assign(pt, spawn(W, H), { age: 0 });
+  }
+  ctx.stroke();
+
+  // Island marker (drawn on the flow layer so trails pass under it visually)
+  const m = D.marker, [mx, my] = toXY(m.lon, m.lat, W, H), r = W / 90;
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(mx, my, r * 0.45, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = Math.max(1.5, W / 450);
+  ctx.beginPath(); ctx.arc(mx, my, r * (1.2 + 0.4 * Math.sin(ts / 400)), 0, 7); ctx.stroke();
+
+  const here = sample(m.lon, m.lat, tUnix);
+  const local = new Date(tUnix * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  $("mapTime").textContent = `${local} · next ${Math.round(span / 3600)}h`;
+  $("mapHere").textContent = here ? `Offshore ${m.name}: ${here.h.toFixed(1)}m ${Math.round(here.p)}s from ${COMPASS[Math.round(here.d / 22.5) % 16]}` : "";
+  $("mapProg").style.width = `${phase * 100}%`;
+  map.raf = requestAnimationFrame(mapFrame);
+}
+
+async function loadMap() {
+  const base = $("iUrl").value.trim().replace(/\/+$/, ""), island = $("sIsland").value;
+  for (const p of [`/map/${island}.json`, `/map/${island}`]) {
+    try {
+      const r = await fetch(base + p, { cache: "no-store" });
+      if (!r.ok) continue;
+      map.data = await r.json(); map.island = island;
+      $("mapTitle").textContent = `${map.data.island.toUpperCase()} · SWELL`;
+      serial(`[map] ${map.data.lats.length}x${map.data.lons.length} grid, ${map.data.times.length}h`);
+      return true;
+    } catch { /* next */ }
+  }
+  serial(`[map] no map data for ${island}`);
+  return false;
+}
+
+async function toggleMap(force) {
+  map.on = force ?? !map.on;
+  $("bMap").classList.toggle("active", map.on);
+  $("oledView").classList.toggle("hidden", map.on);
+  $("mapView").classList.toggle("hidden", !map.on);
+  cancelAnimationFrame(map.raf);
+  if (!map.on) return;
+  if (map.island !== $("sIsland").value && !(await loadMap())) { $("mapTitle").textContent = "NO MAP DATA"; return; }
+  map.t0 = performance.now(); map.parts = []; map.lastField = 0;
+  const flow = $("mapFlow"); flow.getContext("2d").clearRect(0, 0, flow.width, flow.height);
+  map.raf = requestAnimationFrame(mapFrame);
+}
+$("bMap").onclick = () => toggleMap();
+document.addEventListener("keydown", e => { if (e.key === "m" && e.target.tagName !== "INPUT") toggleMap(); });
+setInterval(() => { if (map.on) loadMap(); }, 15 * 60 * 1000);   // same cadence as the device poll
 
 restore();
 let last = performance.now();

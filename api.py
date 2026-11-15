@@ -402,6 +402,18 @@ def get_esp_forecast(island_key: str, blocks: int = Query(8, ge=1, le=16), spot:
     return esp_forecast(island_key, blocks=blocks, spot_key=spot)
 
 
+@app.get("/map/{island_key}")
+def get_swell_map(island_key: str):
+    """Swell height/direction/period grid around the island for the next 12h."""
+    import swellmap
+    if island_key not in swellmap.MAP_REGIONS:
+        raise HTTPException(status_code=404, detail=f"No map region. Available: {list(swellmap.MAP_REGIONS)}")
+    try:
+        return swellmap.fetch_swell_grid(island_key)
+    except UpstreamError as e:
+        raise HTTPException(status_code=502, detail=f"Open-Meteo: {e}")
+
+
 @app.get("/islands")
 def list_islands():
     return {"islands": {k: {"name": i.name, "timezone": i.timezone, "spots": list(s),
