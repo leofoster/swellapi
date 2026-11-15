@@ -9,6 +9,7 @@ Writes, per island and per spot:
     site/esp/spots/<island>/<spot>.json  per-spot payloads (own dir: a file and a
                                    directory cannot share the name esp/<island>)
     site/forecast/<island>.json    full hourly forecast, default spot
+    site/map/<island>.json         swell grid for the next 12h (ambient map)
     site/islands.json
     site/sim/                      the simulator
 
@@ -28,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 
 from api import esp_forecast, island_forecast, list_islands  # noqa: E402
 from surfdeck import ISLANDS  # noqa: E402
+from swellmap import MAP_REGIONS, fetch_swell_grid  # noqa: E402
 
 BLOCKS = 16  # 48h. Devices drop blocks that are already in the past, so a stale file still works.
 
@@ -61,8 +63,19 @@ def main() -> int:
             failed.append(island_key)
             print(f"FAIL  {island_key}: {getattr(e, 'detail', e)}", file=sys.stderr)
 
+    # Maps are a nice-to-have: a failure is logged but does not fail the build.
+    map_failed = []
+    for island_key in MAP_REGIONS:
+        try:
+            write(out / "map" / f"{island_key}.json", fetch_swell_grid(island_key))
+            print(f"ok    map {island_key}")
+        except Exception as e:
+            map_failed.append(island_key)
+            print(f"WARN  map {island_key}: {e}", file=sys.stderr)
+
     write(out / "islands.json", list_islands())
-    write(out / "status.json", {"generated": now.isoformat(timespec="seconds"), "failed": failed})
+    write(out / "status.json", {"generated": now.isoformat(timespec="seconds"), "failed": failed,
+                                     "map_failed": map_failed})
     shutil.copytree(ROOT / "simulator", out / "sim")
     (out / "index.html").write_text('<meta http-equiv="refresh" content="0; url=sim/">')
     (out / ".nojekyll").write_text("")

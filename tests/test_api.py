@@ -79,3 +79,27 @@ def test_upstream_error_is_502_with_reason(monkeypatch):
     r = TestClient(api.app).get("/esp/bermuda")
     assert r.status_code == 502
     assert "429" in r.json()["detail"]
+
+
+def test_map_grid_parsing(monkeypatch):
+    import swellmap
+
+    class Resp:
+        status_code = 200
+        def __init__(self, n): self.n = n
+        def json(self):
+            return [{"hourly": {"time": ["2026-07-01T00:00", "2026-07-01T01:00"],
+                                "swell_wave_height": [None, None] if k == 0 else [1.234, 1.5],
+                                "swell_wave_direction": [None, None] if k == 0 else [350.4, 10],
+                                "swell_wave_period": [None, None] if k == 0 else [9.04, 9]}}
+                    for k in range(self.n)]
+
+    region = swellmap.MAP_REGIONS["bermuda"]
+    ny = len(swellmap._frange(*region["lat"], region["step"]))
+    nx = len(swellmap._frange(*region["lon"], region["step"]))
+    monkeypatch.setattr(swellmap.surfdeck._session, "get", lambda *a, **k: Resp(nx * ny))
+    g = swellmap.fetch_swell_grid("bermuda")
+    assert len(g["h"]) == 2 and len(g["h"][0]) == ny and len(g["h"][0][0]) == nx
+    assert g["h"][0][0][0] is None            # first point is land
+    assert g["h"][0][0][1] == 1.23 and g["d"][0][0][1] == 350
+    assert g["times"][1] - g["times"][0] == 3600

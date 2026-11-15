@@ -51,19 +51,20 @@ const uint32_t PAGE_MS      = 4000;                    // time on each block
 const uint32_t STALE_S      = 3UL * 3600UL;            // data older than this gets "!"
 const uint32_t BLOCK_S      = 3UL * 3600UL;
 
-// Layout. Rows 0-15 are the yellow band on two-colour panels.
+// Layout. Rows 0-15 are the yellow band on two-colour panels: spot name,
+// time and the NOW/+Nh tag live there so you can always tell which spot it is.
 #if SCREEN_HEIGHT >= 64
-  const int16_t Y_QUALITY = 0,  Y_TAG = 0,  Y_TIME = 8,
-                Y_RULE    = 17, Y_BIG = 21, Y_DET  = 25,
-                Y_WIND    = 40, Y_BAR = 54, BAR_H  = 8;
-  const bool    COMPACT   = false;
+  const int16_t Y_NAME = 0,  Y_TIME = 8,  Y_RULE = 16, Y_QUALITY = 18,
+                Y_BIG  = 36, Y_DET  = 36, Y_WIND = 44, Y_BAR = 55, BAR_H = 8;
+  const bool    COMPACT = false;
 #else
-  const int16_t Y_QUALITY = 0,  Y_TAG = 0,  Y_TIME = 8,
-                Y_RULE    = 15, Y_BIG = 16, Y_DET  = 16,   // two 8px lines: 16-23, 24-31
-                Y_WIND    = 24, Y_BAR = 0,  BAR_H  = 0;
-  const bool    COMPACT   = true;
+  // 128x32: name/tag, rating/time, swell, wind. No rule, no bar.
+  const int16_t Y_NAME = 0,  Y_TIME = 8,  Y_RULE = 0,  Y_QUALITY = 8,
+                Y_BIG  = 16, Y_DET  = 16, Y_WIND = 24, Y_BAR = 0,  BAR_H = 0;
+  const bool    COMPACT = true;
 #endif
-const int16_t X_RIGHT = 86, X_DET = 56, X_WARN = 122;
+const int16_t X_TAG = 92, X_TIME_C = 86, X_DET = 60, X_PCT = 104, X_WARN = 122;
+const uint8_t NAME_CHARS = 15;     // 15 x 6px = 90px, clear of the tag at x=92
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
@@ -242,46 +243,62 @@ static int nextVisible(int from, uint32_t now) {
 static void drawBlock(const Block &v, uint32_t now, bool warn) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
-  display.setTextSize(2);
-  display.setCursor(0, Y_QUALITY);
-  display.print(v.quality);
-
   display.setTextSize(1);
-  display.setCursor(X_RIGHT, Y_TAG);
+
+  // Header: spot name, NOW/+Nh, stale marker
+  char name[NAME_CHARS + 1];
+  copyStr(name, sizeof(name), spotName);
+  display.setCursor(0, Y_NAME);
+  display.print(name);
+
+  display.setCursor(X_TAG, Y_NAME);
   int hrs = v.hoursFromNow;
   if (now && v.start) hrs = v.start > now ? (int)((v.start - now + 1799) / 3600) : 0;
   if (hrs <= 0) display.print(" NOW");
   else          display.printf(" +%dh", hrs);
-  display.setCursor(X_RIGHT, Y_TIME);
-  display.print(v.timeLabel);
-
-  if (warn) { display.setCursor(X_WARN, Y_TAG); display.print("!"); }
-
-  display.drawFastHLine(0, Y_RULE, SCREEN_WIDTH, SSD1306_WHITE);
+  if (warn) { display.setCursor(X_WARN, Y_NAME); display.print("!"); }
 
   if (COMPACT) {
+    display.setCursor(0, Y_QUALITY);
+    display.print(v.quality);
+    display.setCursor(X_TIME_C, Y_TIME);
+    display.print(v.timeLabel);
     display.setCursor(0, Y_BIG);
     display.printf("%.1fm %.0fs %s", v.swellHeight, v.swellPeriod, v.swellDir);
     display.setCursor(0, Y_WIND);
     display.printf("W %.0fmph %s  %d%%", v.windSpeed, v.windDir, (int)(v.rating * 100));
-  } else {
-    display.setTextSize(2);
-    display.setCursor(0, Y_BIG);
-    display.printf("%.1fm", v.swellHeight);
-    display.setTextSize(1);
-    display.setCursor(X_DET, Y_DET);
-    display.printf("%.0fs %s", v.swellPeriod, v.swellDir);
-
-    display.setCursor(0, Y_WIND);
-    display.printf("WND %.0fmph %s", v.windSpeed, v.windDir);
-
-    int16_t barW = (int16_t)(v.rating * SCREEN_WIDTH);
-    if (barW < 2) barW = 2;
-    if (barW > SCREEN_WIDTH) barW = SCREEN_WIDTH;
-    display.drawRect(0, Y_BAR, SCREEN_WIDTH, BAR_H, SSD1306_WHITE);
-    display.fillRect(0, Y_BAR, barW, BAR_H, SSD1306_WHITE);
+    display.display();
+    return;
   }
+
+  display.setCursor(0, Y_TIME);
+  display.print(v.timeLabel);
+  display.drawFastHLine(0, Y_RULE, SCREEN_WIDTH, SSD1306_WHITE);
+
+  // Rating word large, score beside it
+  display.setTextSize(2);
+  display.setCursor(0, Y_QUALITY);
+  display.print(v.quality);
+  display.setTextSize(1);
+  display.setCursor(X_PCT, Y_QUALITY + 4);
+  display.printf("%3d%%", (int)(v.rating * 100));
+
+  // Swell height large; period/dir and wind beside it
+  display.setTextSize(2);
+  display.setCursor(0, Y_BIG);
+  display.printf("%.1fm", v.swellHeight);
+  display.setTextSize(1);
+  display.setCursor(X_DET, Y_DET);
+  display.printf("%.0fs %s", v.swellPeriod, v.swellDir);
+  display.setCursor(X_DET, Y_WIND);
+  display.printf("%.0fmph %s", v.windSpeed, v.windDir);
+
+  // Proportional rating bar: the stand-in for green/red on a mono panel
+  int16_t barW = (int16_t)(v.rating * SCREEN_WIDTH);
+  if (barW < 2) barW = 2;
+  if (barW > SCREEN_WIDTH) barW = SCREEN_WIDTH;
+  display.drawRect(0, Y_BAR, SCREEN_WIDTH, BAR_H, SSD1306_WHITE);
+  display.fillRect(0, Y_BAR, barW, BAR_H, SSD1306_WHITE);
   display.display();
 }
 

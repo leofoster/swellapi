@@ -62,6 +62,22 @@ start. `/debug/upstream` shows what Open-Meteo says over the route the app
 actually uses. `api_prox.py` is the old home-PC relay; it is not needed for the
 default setup.
 
+## Swell map (big-screen proof of concept)
+
+The hourly build also writes `site/map/<island>.json`: swell height, direction
+and period on a ~1.5 degree grid for the next 12 hours, from one Open-Meteo
+request (land comes back null and doubles as the coastline). The simulator's
+**Swell map** button (or `m`) animates it: colour = height, particles move the
+way the swell travels, faster for longer periods, looping over the next 3 hours.
+Map failures are logged in `status.json` (`map_failed`) but never fail the build.
+
+The readout is offshore swell. The OLED shows what reaches the chosen spot after
+shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
+
+Unverified: Open-Meteo may count each grid point against the daily quota
+(~230 points per island per hour). If the build starts seeing 429s, coarsen
+`MAP_REGIONS` in `swellmap.py` or build maps less often.
+
 ## Not yet true
 
 - Tides: `fetch_mock_tides` is synthetic. It is off unless `MOCK_TIDES=1`, and
