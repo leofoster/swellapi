@@ -19,6 +19,7 @@ and the last good deploy stays live.
 """
 import argparse
 import json
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -29,7 +30,13 @@ sys.path.insert(0, str(ROOT))
 
 from api import esp_forecast, island_forecast, list_islands  # noqa: E402
 from surfdeck import ISLANDS  # noqa: E402
-from swellmap import MAP_REGIONS, fetch_swell_grid  # noqa: E402
+from swellmap import MAP_REGIONS, MAP_HOURS, fetch_swell_grid  # noqa: E402
+
+import requests  # noqa: E402
+
+# Where the last build is published. Set by the workflow; maps are reused from
+# here between scheduled rebuilds so Open-Meteo is not asked every hour.
+SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
 
 BLOCKS = 16  # 48h. Devices drop blocks that are already in the past, so a stale file still works.
 
@@ -37,6 +44,26 @@ BLOCKS = 16  # 48h. Devices drop blocks that are already in the past, so a stale
 def write(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, separators=(",", ":")))
+
+
+def published_map(region_key: str):
+    if not SITE_URL:
+        return None
+    try:
+        r = requests.get(f"{SITE_URL}/map/{region_key}.json", timeout=20)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def build_map(region_key: str, every_h: int, now: datetime):
+    """Rebuild on the region's cadence (UTC hour divisible by every_h); otherwise
+    reuse the published copy while it still covers the next day."""
+    if now.hour % every_h:
+        old = published_map(region_key)
+        if old and old.get("times") and old["times"][-1] - now.timestamp() > (MAP_HOURS - every_h - 2) * 3600:
+            return old, "reused"
+    return fetch_swell_grid(region_key), "fetched"
 
 
 def main() -> int:
@@ -65,13 +92,14 @@ def main() -> int:
 
     # Maps are a nice-to-have: a failure is logged but does not fail the build.
     map_failed = []
-    for island_key in MAP_REGIONS:
+    for region_key, region in MAP_REGIONS.items():
         try:
-            write(out / "map" / f"{island_key}.json", fetch_swell_grid(island_key))
-            print(f"ok    map {island_key}")
+            data, how = build_map(region_key, region["every_h"], now)
+            write(out / "map" / f"{region_key}.json", data)
+            print(f"ok    map {region_key} ({how})")
         except Exception as e:
-            map_failed.append(island_key)
-            print(f"WARN  map {island_key}: {e}", file=sys.stderr)
+            map_failed.append(region_key)
+            print(f"WARN  map {region_key}: {e}", file=sys.stderr)
 
     write(out / "islands.json", list_islands())
     write(out / "status.json", {"generated": now.isoformat(timespec="seconds"), "failed": failed,

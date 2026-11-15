@@ -61,6 +61,11 @@
   .dots i { width: 6px; height: 6px; border-radius: 50%; background: #555; }
   .dots i.on { background: #e0e0e0; width: 9px; height: 9px; }
   .hidden { display: none !important; }
+  .tunegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 16px; }
+  .trow { display: flex; gap: 8px; align-items: center; }
+  .trow input[type=range] { flex: 1; min-width: 0; }
+  .trow select { width: 100%; }
+  .tval { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); min-width: 34px; text-align: right; }
   button.active { border-color: var(--accent); color: var(--accent); }
   .full { grid-column: 1 / -1; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -124,8 +129,6 @@
       <div class="row">
         <div><label for="sSpeed">Speed</label>
           <select id="sSpeed"><option value="1">1×</option><option value="10">10×</option><option value="60">60×</option><option value="600">600×</option></select></div>
-        <div><label for="sMapStep">Map step</label>
-          <select id="sMapStep"><option value="3">3 hours</option><option value="6">6 hours</option></select></div>
         <div><label>Warp clock</label><div class="row"><button id="bWarp1">+1h</button><button id="bWarp6">+6h</button><button id="bWarp0">reset</button></div></div>
       </div>
     </div>
@@ -141,6 +144,16 @@
       </div>
     </div>
   </aside>
+
+  <section class="card full hidden" id="tuneCard">
+    <h2>Map tuning</h2>
+    <div class="tunegrid" id="tuneGrid"></div>
+    <div class="row" style="margin-top:12px;max-width:420px">
+      <button id="bTuneReset">Reset to defaults</button><button id="bTuneCopy">Copy settings</button>
+    </div>
+    <pre id="tuneOut" class="hint"></pre>
+    <p class="hint">Changes apply live and are remembered in this browser. To make them the defaults, paste "Copy settings" into MAP_DEFAULTS in simulator/index.html.</p>
+  </section>
 
   <section class="card full">
     <h2>Serial monitor · 115200</h2>
@@ -515,192 +528,315 @@ $("bWarp6").onclick = () => { warpS += 6 * 3600; serial("[sim] clock +6h"); draw
 $("bWarp0").onclick = () => { warpS = 0; serial("[sim] clock reset"); drawPage(); };
 $("sHeight").onchange = () => { persist(); setup(); };
 $("sColor").onchange = () => { persist(); paint(); };
-$("sIsland").onchange = () => { persist(); fillSpots(); setup(); map.island = null; if (map.on) toggleMap(true); };
+$("sIsland").onchange = () => { persist(); fillSpots(); setup(); map.key = null; if (map.on) toggleMap(true); };
 $("sSpot").onchange = () => setup();
 $("iUrl").onchange = () => { persist(); loadIslands(); setup(); };
 
 /* ───────────────────────── Swell map (big-screen POC) ─────────────────────────
    Port of scripts/ocean_swell_map.py: streamlines on a dark ground, coloured and
-   thickened by swell height on one scale shared by every frame, stepping through
-   the forecast every 3 or 6 hours. Like the Python, lines follow dir_to_uv's
-   rotated vectors, so they run along the swell crests.
-   Data: <API_URL>/map/<island>.json (static) or /map/<island> (live API). */
-const MAP_FRAME_MS = 1200, MAP_HOLD_MS = 2000;          // Python: interval / repeat_delay
-const MAP_DENSITY = 1.4;
-const map = { data: null, on: false, island: null, frame: 0, timer: 0, cache: {}, hmin: 0, hmax: 1 };
+   thickened by swell height, stepping through the forecast every 3 or 6 hours.
+   Every knob is in MAP_DEFAULTS and the "Map tuning" panel; "Copy settings"
+   gives you a JSON blob to paste back here as the new defaults.
+   Swell data: <API_URL>/map/<region>.json (static) or /map/<region> (live API).
+   Coastline: Natural Earth land (public domain) via the world-atlas package. */
+const MAP_DEFAULTS = {
+  area: "local",        // local (around the island) | global
+  stepH: 3,             // hours between frames: 3 | 6
+  lineDir: "crests",    // crests: along the swell lines, as the Python does | travel: the way swell moves
+  density: 1.4,         // how many lines (matplotlib streamplot density)
+  stepSize: 0.25,       // integration step, as a fraction of a seed cell; smaller = smoother, slower
+  minLen: 8,            // drop lines shorter than this many steps
+  maxLen: 4000,         // cap on steps each way from the seed
+  seeds: "spiral",      // spiral (matplotlib) | grid | random
+  interp: "bilinear",   // bilinear (smooth) | nearest (blocky, more stylised)
+  coastReach: 0.75,     // 0 = stop as soon as any grid neighbour is land; 1 = run right up to it
+  widthMin: 0.5,        // line width at the smallest swell (Python: 0.5)
+  widthMax: 3.0,        // line width at the biggest swell (Python: 0.5 + 2.5)
+  colormap: "rainbow",  // rainbow (Python default) | blues | viridis | mono
+  scale: "shared",      // shared: one colour scale for all frames | frame: rescale each frame
+  opacity: 1.0,
+  land: "outline",      // outline | fill | both | none
+  coast: "#8b949e",     // coastline colour
+  clipSea: true,        // cut lines at the real coastline (the swell grid itself is coarse)
+  markers: true,
+  frameMs: 1200,        // time per frame (Python: interval_ms)
+  holdMs: 2000,         // pause on the last frame (Python: repeat_delay)
+  fadeMs: 250,          // fade-in of each new frame
+};
+const TUNE_SPEC = [
+  ["area", "Map area", ["local", "global"]],
+  ["stepH", "Frame step (h)", [3, 6]],
+  ["lineDir", "Line direction", ["crests", "travel"]],
+  ["density", "Density", 0.3, 4, 0.1],
+  ["stepSize", "Step size", 0.05, 1, 0.05],
+  ["minLen", "Min length", 2, 80, 1],
+  ["maxLen", "Max length", 20, 4000, 10],
+  ["seeds", "Seeding", ["spiral", "grid", "random"]],
+  ["interp", "Interpolation", ["bilinear", "nearest"]],
+  ["coastReach", "Coast reach", 0, 0.99, 0.01],
+  ["widthMin", "Width min", 0.1, 6, 0.1],
+  ["widthMax", "Width max", 0.1, 10, 0.1],
+  ["colormap", "Colours", ["rainbow", "blues", "viridis", "mono"]],
+  ["scale", "Colour scale", ["shared", "frame"]],
+  ["opacity", "Opacity", 0.1, 1, 0.05],
+  ["land", "Land", ["outline", "fill", "both", "none"]],
+  ["coast", "Coast colour", "color"],
+  ["clipSea", "Clip lines to sea", "bool"],
+  ["markers", "Spot markers", "bool"],
+  ["frameMs", "Frame ms", 100, 5000, 50],
+  ["holdMs", "Hold ms", 0, 10000, 100],
+  ["fadeMs", "Fade ms", 0, 2000, 50],
+];
+let T = { ...MAP_DEFAULTS };
+try { Object.assign(T, JSON.parse(localStorage.getItem("surfsim.tune") || "{}")); } catch {}
 
-// matplotlib "rainbow"
-function rainbow(x) {
+const map = { data: null, key: null, on: false, frame: 0, timer: 0, cache: {}, hmin: 0, hmax: 1, land: {} };
+
+/* colour maps (x in 0..1) */
+const lerpStops = (stops, x) => {
   x = Math.max(0, Math.min(1, x));
-  return `rgb(${Math.round(Math.abs(2 * x - 0.5) * 255)},${Math.round(Math.sin(Math.PI * x) * 255)},${Math.round(Math.cos(Math.PI * x / 2) * 255)})`;
-}
+  const i = Math.min(stops.length - 2, Math.floor(x * (stops.length - 1))), f = x * (stops.length - 1) - i;
+  const a = stops[i], b = stops[i + 1];
+  return `rgb(${a.map((c, k) => Math.round(c + (b[k] - c) * f)).join(",")})`;
+};
+const COLORMAPS = {
+  rainbow: x => { x = Math.max(0, Math.min(1, x));   // matplotlib "rainbow"
+    return `rgb(${Math.round(Math.abs(2 * x - 0.5) * 255)},${Math.round(Math.sin(Math.PI * x) * 255)},${Math.round(Math.cos(Math.PI * x / 2) * 255)})`; },
+  blues: x => lerpStops([[66, 146, 198], [107, 174, 214], [158, 202, 225], [198, 219, 239], [247, 251, 255]], x),
+  viridis: x => lerpStops([[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]], x),
+  mono: x => `rgba(235,242,250,${0.25 + 0.75 * Math.max(0, Math.min(1, x))})`,
+};
+const cmap = x => COLORMAPS[T.colormap](x);
 
-// Python dir_to_uv(): theta = dir + 180; returns (-cos(theta), sin(theta))
-function dirToUV(deg) { const t = (deg + 180) * Math.PI / 180; return [-Math.cos(t), Math.sin(t)]; }
-
-function bilinear(G, fx, fy) {
+/* field sampling in grid coordinates (fx along lons, fy along lats) */
+function sampleGrid(G, fx, fy) {
   const ny = G.length, nx = G[0].length;
   if (fx < 0 || fy < 0 || fx > nx - 1 || fy > ny - 1) return null;
+  if (T.interp === "nearest") return G[Math.round(fy)][Math.round(fx)];
   const x0 = Math.min(nx - 2, Math.floor(fx)), y0 = Math.min(ny - 2, Math.floor(fy)), tx = fx - x0, ty = fy - y0;
-  const a = G[y0][x0], b = G[y0][x0 + 1], c = G[y0 + 1][x0], d = G[y0 + 1][x0 + 1];
-  if (a == null || b == null || c == null || d == null) return null;     // touches land
-  return a * (1 - tx) * (1 - ty) + b * tx * (1 - ty) + c * (1 - tx) * ty + d * tx * ty;
+  // Weighted by the corners that are sea, so lines run up to the coast (the Python fills
+  // land gaps from neighbours). coastReach = minimum sea weight to keep going.
+  let sw = 0, sv = 0;
+  for (const [v, w] of [[G[y0][x0], (1 - tx) * (1 - ty)], [G[y0][x0 + 1], tx * (1 - ty)], [G[y0 + 1][x0], (1 - tx) * ty], [G[y0 + 1][x0 + 1], tx * ty]])
+    if (v != null) { sw += w; sv += v * w; }
+  return sw >= 1 - T.coastReach && sw > 0 ? sv / sw : null;
 }
 
-// Simplified matplotlib streamplot: seed over a coarse mask (spiral from the edge in),
-// integrate both ways with RK2, stop at land, edges, or a mask cell another line owns.
-function streamlines(f) {
+// Unit vector (east, north) for a "coming from" bearing.
+// crests = Python dir_to_uv(): (-cos(dir+180), sin(dir+180)), i.e. 90 degrees off travel.
+function dirToUV(deg) {
+  const t = (deg + 180) * Math.PI / 180;
+  return T.lineDir === "travel" ? [Math.sin(t), Math.cos(t)] : [-Math.cos(t), Math.sin(t)];
+}
+
+let rngState = 1;
+const rng = () => (rngState = (rngState * 16807) % 2147483647) / 2147483647;
+
+// Simplified matplotlib streamplot.
+function streamlines(f, aspect) {
   const D = map.data, ny = D.lats.length, nx = D.lons.length;
   const U = D.d[f].map(r => r.map(v => v == null ? null : dirToUV(v)[0]));
   const V = D.d[f].map(r => r.map(v => v == null ? null : dirToUV(v)[1]));
   const H = D.h[f];
-  const MX = Math.round(30 * MAP_DENSITY), MY = Math.round(30 * MAP_DENSITY);
+  const base = 30 * T.density, MX = Math.max(4, Math.round(base * Math.sqrt(aspect))), MY = Math.max(4, Math.round(base / Math.sqrt(aspect)));
   const mask = new Int32Array(MX * MY).fill(-1);
-  const cell = (fx, fy) => {
-    const i = Math.min(MX - 1, Math.floor(fx / (nx - 1) * MX)), j = Math.min(MY - 1, Math.floor(fy / (ny - 1) * MY));
-    return j * MX + i;
-  };
-  const ds = Math.min((nx - 1) / MX, (ny - 1) / MY) * 0.25;
+  const cell = (x, y) => Math.min(MY - 1, Math.floor(y / (ny - 1) * MY)) * MX + Math.min(MX - 1, Math.floor(x / (nx - 1) * MX));
+  const ds = Math.min((nx - 1) / MX, (ny - 1) / MY) * T.stepSize;
   const vel = (x, y) => {
-    const u = bilinear(U, x, y), v = bilinear(V, x, y);
+    const u = sampleGrid(U, x, y), v = sampleGrid(V, x, y);
     if (u == null || v == null) return null;
     const m = Math.hypot(u, v) || 1;
     return [u / m, v / m];
   };
-
   function trace(x, y, sign, id) {
     const pts = [];
-    for (let k = 0; k < 4000; k++) {
+    for (let k = 0; k < T.maxLen; k++) {
       const v1 = vel(x, y); if (!v1) break;
-      const mx = x + sign * v1[0] * ds / 2, my = y + sign * v1[1] * ds / 2;
-      const v2 = vel(mx, my); if (!v2) break;
+      const v2 = vel(x + sign * v1[0] * ds / 2, y + sign * v1[1] * ds / 2); if (!v2) break;
       const nx2 = x + sign * v2[0] * ds, ny2 = y + sign * v2[1] * ds;
       if (nx2 < 0 || ny2 < 0 || nx2 > nx - 1 || ny2 > ny - 1) break;
       const c = cell(nx2, ny2);
       if (mask[c] !== -1 && mask[c] !== id) break;
-      mask[c] = id;
-      x = nx2; y = ny2;
-      pts.push([x, y, bilinear(H, x, y)]);
+      mask[c] = id; x = nx2; y = ny2;
+      pts.push([x, y, sampleGrid(H, x, y)]);
     }
     return pts;
   }
-
-  // spiral order over mask cells, outside in (as matplotlib does)
-  const order = [];
-  let l = 0, r = MX - 1, t = 0, b = MY - 1;
-  while (l <= r && t <= b) {
-    for (let i = l; i <= r; i++) order.push([i, t]);
-    for (let j = t + 1; j <= b; j++) order.push([r, j]);
-    if (t < b) for (let i = r - 1; i >= l; i--) order.push([i, b]);
-    if (l < r) for (let j = b - 1; j > t; j--) order.push([l, j]);
-    l++; r--; t++; b--;
+  let order = [];
+  if (T.seeds === "spiral") {
+    let l = 0, r = MX - 1, t = 0, b = MY - 1;
+    while (l <= r && t <= b) {
+      for (let i = l; i <= r; i++) order.push([i, t]);
+      for (let j = t + 1; j <= b; j++) order.push([r, j]);
+      if (t < b) for (let i = r - 1; i >= l; i--) order.push([i, b]);
+      if (l < r) for (let j = b - 1; j > t; j--) order.push([l, j]);
+      l++; r--; t++; b--;
+    }
+  } else {
+    for (let j = 0; j < MY; j++) for (let i = 0; i < MX; i++) order.push([i, j]);
+    if (T.seeds === "random") { rngState = 7; for (let i = order.length - 1; i > 0; i--) { const k = Math.floor(rng() * (i + 1)); [order[i], order[k]] = [order[k], order[i]]; } }
   }
-
   const lines = [];
   for (const [i, j] of order) {
     if (mask[j * MX + i] !== -1) continue;
     const sx = (i + 0.5) / MX * (nx - 1), sy = (j + 0.5) / MY * (ny - 1);
     if (!vel(sx, sy)) continue;
-    const id = lines.length;
+    const id = lines.length + 1;
     mask[j * MX + i] = id;
-    const back = trace(sx, sy, -1, id).reverse(), fwd = trace(sx, sy, 1, id);
-    const pts = [...back, [sx, sy, bilinear(H, sx, sy)], ...fwd];
-    if (pts.length < 8) { for (let c = 0; c < mask.length; c++) if (mask[c] === id) mask[c] = -2; continue; }
+    const pts = [...trace(sx, sy, -1, id).reverse(), [sx, sy, sampleGrid(H, sx, sy)], ...trace(sx, sy, 1, id)];
+    if (pts.length < T.minLen) { for (let c = 0; c < mask.length; c++) if (mask[c] === id) mask[c] = -2; continue; }
     lines.push(pts);
   }
   return lines;
 }
 
-function mapCanvas() {
-  const c = $("mapCanvas"), r = $("mapView").getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
-  const W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
-  if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
-  return { c, W, H };
+/* projection: equirectangular, aspect-correct, letterboxed (local maps squash longitude by cos(lat)) */
+function projection(W, H) {
+  const D = map.data, lon0 = D.lons[0], lon1 = D.lons.at(-1), lat0 = D.lats[0], lat1 = D.lats.at(-1);
+  const k = map.key === "global" ? 1 : Math.cos((lat0 + lat1) / 2 * Math.PI / 180);
+  const top = H * 0.11, bot = H * 0.1, pad = W * 0.02;
+  const bw = W - 2 * pad, bh = H - top - bot, geo = (lon1 - lon0) * k / (lat1 - lat0);
+  const w = Math.min(bw, bh * geo), h = w / geo, x0 = pad + (bw - w) / 2, y0 = top + (bh - h) / 2;
+  const px = lon => x0 + (lon - lon0) / (lon1 - lon0) * w, py = lat => y0 + (lat1 - lat) / (lat1 - lat0) * h;
+  return { x0, y0, w, h, px, py, aspect: w / h,
+           gx: fx => px(lon0 + fx / (D.lons.length - 1) * (lon1 - lon0)),
+           gy: fy => py(lat0 + fy / (D.lats.length - 1) * (lat1 - lat0)) };
+}
+
+/* coastline */
+function loadScript(src) {
+  return new Promise((ok, bad) => { const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = bad; document.head.appendChild(s); });
+}
+async function loadLand(res) {
+  if (map.land[res]) return map.land[res];
+  try {
+    if (!window.topojson) await loadScript("https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js");
+    const topo = await (await fetch(`https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/land-${res}.json`)).json();
+    const f = topojson.feature(topo, topo.objects.land);
+    map.land[res] = (f.features || [f]).flatMap(g => g.geometry.type === "Polygon" ? [g.geometry.coordinates] : g.geometry.coordinates);
+  } catch (e) { serial(`[map] coastline unavailable: ${e.message}`); map.land[res] = []; }
+  return map.land[res];
+}
+function landPath(ctx, P, polys) {
+  ctx.beginPath();
+  for (const poly of polys) for (const ring of poly) {
+    let prev = null;
+    for (const [lon, lat] of ring) {
+      const x = P.px(lon), y = P.py(lat);
+      if (prev === null || Math.abs(lon - prev) > 180) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      prev = lon;
+    }
+  }
 }
 
 function drawMapFrame(f, alpha = 1) {
-  const D = map.data, { c, W, H } = mapCanvas(), ctx = c.getContext("2d");
-  const nx = D.lons.length, ny = D.lats.length;
-  const pad = W * 0.03, top = H * 0.11, bot = H * 0.1;
-  const X = fx => pad + fx / (nx - 1) * (W - 2 * pad);
-  const Y = fy => H - bot - fy / (ny - 1) * (H - top - bot);
-
+  const D = map.data, { c, W, H } = mapCanvas(), ctx = c.getContext("2d"), P = projection(W, H);
+  const scale = W / 900;
   ctx.globalAlpha = 1;
   ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, W, H);
-  // land: grid cells with no sea value, drawn as soft blocks
-  ctx.fillStyle = "#161b22";
-  const cw = (W - 2 * pad) / (nx - 1), ch = (H - top - bot) / (ny - 1);
-  D.h[f].forEach((row, y) => row.forEach((v, x) => { if (v == null) ctx.fillRect(X(x) - cw / 2, Y(y) - ch / 2, cw + 1, ch + 1); }));
+  ctx.save(); ctx.beginPath(); ctx.rect(P.x0, P.y0, P.w, P.h); ctx.clip();
 
-  ctx.globalAlpha = alpha;
-  const lines = map.cache[f] ??= streamlines(f);
-  const scale = W / 900, span = Math.max(map.hmax - map.hmin, 0.1);
-  ctx.lineCap = "round";
-  for (const pts of lines) for (let k = 1; k < pts.length; k++) {
-    const h = pts[k][2] ?? map.hmin, hn = (h - map.hmin) / span;
-    ctx.strokeStyle = rainbow(hn);
-    ctx.lineWidth = (0.5 + hn * 2.5) * scale * 1.3;
-    ctx.beginPath(); ctx.moveTo(X(pts[k - 1][0]), Y(pts[k - 1][1])); ctx.lineTo(X(pts[k][0]), Y(pts[k][1])); ctx.stroke();
+  const polys = map.land[map.key === "global" ? "110m" : "50m"] || [];
+  if (T.land === "fill" || T.land === "both") { landPath(ctx, P, polys); ctx.fillStyle = "#161b22"; ctx.fill("evenodd"); }
+
+  // lines
+  let lo = map.hmin, hi = map.hmax;
+  if (T.scale === "frame") { const hs = D.h[f].flat().filter(v => v != null); lo = Math.min(...hs); hi = Math.max(...hs); }
+  const span = Math.max(hi - lo, 0.1);
+  const lines = map.cache[f] ??= streamlines(f, P.aspect);
+  ctx.save();
+  if (T.clipSea && polys.length) {   // ocean = view box minus land (even-odd), so lines stop at the real coast
+    ctx.beginPath(); ctx.rect(P.x0, P.y0, P.w, P.h);
+    for (const poly of polys) for (const ring of poly) {
+      let prev = null;
+      for (const [lon, lat] of ring) {
+        const x = P.px(lon), y = P.py(lat);
+        if (prev === null || Math.abs(lon - prev) > 180) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        prev = lon;
+      }
+    }
+    ctx.clip("evenodd");
   }
+  ctx.globalAlpha = alpha * T.opacity; ctx.lineCap = "round";
+  for (const pts of lines) for (let k = 1; k < pts.length; k++) {
+    const hn = ((pts[k][2] ?? lo) - lo) / span;
+    ctx.strokeStyle = cmap(hn);
+    ctx.lineWidth = (T.widthMin + hn * (T.widthMax - T.widthMin)) * scale;
+    ctx.beginPath(); ctx.moveTo(P.gx(pts[k - 1][0]), P.gy(pts[k - 1][1])); ctx.lineTo(P.gx(pts[k][0]), P.gy(pts[k][1])); ctx.stroke();
+  }
+  ctx.restore();
   ctx.globalAlpha = 1;
 
-  // island marker
-  const m = D.marker;
-  const mx = X((m.lon - D.lons[0]) / (D.lons.at(-1) - D.lons[0]) * (nx - 1));
-  const my = Y((m.lat - D.lats[0]) / (D.lats.at(-1) - D.lats[0]) * (ny - 1));
-  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(mx, my, 4 * scale + 1, 0, 7); ctx.fill();
-  ctx.strokeStyle = "#0d1117"; ctx.lineWidth = 2 * scale; ctx.stroke();
-  ctx.fillStyle = "#e0e0e0"; ctx.font = `${Math.round(12 * scale + 4)}px system-ui, sans-serif`;
-  ctx.fillText(m.name, mx + 9 * scale, my - 7 * scale);
+  if (T.land === "outline" || T.land === "both") {
+    landPath(ctx, P, polys); ctx.strokeStyle = T.coast; ctx.lineWidth = Math.max(1, 1.1 * scale); ctx.lineJoin = "round"; ctx.stroke();
+  }
+  if (T.markers) for (const m of D.markers || [D.marker]) {
+    const mx = P.px(m.lon), my = P.py(m.lat);
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(mx, my, 3.5 * scale + 1, 0, 7); ctx.fill();
+    ctx.fillStyle = "#e0e0e0"; ctx.font = `${Math.round(11 * scale + 4)}px system-ui, sans-serif`;
+    ctx.fillText(m.name, mx + 8 * scale, my - 6 * scale);
+  }
+  ctx.restore();
 
-  // labels (Python: "<ocean> · Now — 15 Nov 19:00")
-  const t = D.times[f], hrs = Math.round((t - D.times[0]) / 3600);
+  // labels
+  document.querySelector(".ramp").style.background = `linear-gradient(90deg, ${[0, .25, .5, .75, 1].map(cmap).join(",")})`;
+  $("mapMin").textContent = `${lo.toFixed(1)} m`; $("mapMax").textContent = `${hi.toFixed(1)} m`;
+  const t = D.times[f], hrs = Math.round((t - Date.now() / 1000) / 3600);
   const when = new Date(t * 1000).toLocaleString("en-GB", { timeZone: D.timezone || "UTC", weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  $("mapTime").textContent = `${hrs === 0 ? "Now" : "+" + hrs + "h"}  —  ${when}`;
+  $("mapTime").textContent = `${hrs <= 0 ? "Now" : "+" + hrs + "h"}  —  ${when}${map.key === "global" ? " UTC" : ""}`;
+  const m = D.marker, nx = D.lons.length, ny = D.lats.length;
   const fx = (m.lon - D.lons[0]) / (D.lons.at(-1) - D.lons[0]) * (nx - 1), fy = (m.lat - D.lats[0]) / (D.lats.at(-1) - D.lats[0]) * (ny - 1);
-  const hh = bilinear(D.h[f], fx, fy), pp = bilinear(D.p[f], fx, fy);
+  const hh = map.key === "global" ? null : sampleGrid(D.h[f], fx, fy), pp = hh == null ? null : sampleGrid(D.p[f], fx, fy);
   $("mapHere").textContent = hh != null ? `Offshore ${m.name}: ${hh.toFixed(1)}m ${pp != null ? Math.round(pp) + "s" : ""}` : "";
 }
 
-function mapFrames() { const stride = +$("sMapStep").value / (map.data.step_h || 3); return map.data.times.map((_, i) => i).filter(i => i % stride === 0); }
-
-function renderDots(frames, cur) {
-  $("mapDots").innerHTML = frames.map(f => `<i class="${f === cur ? "on" : ""}"></i>`).join("");
+function mapCanvas() {
+  const c = $("mapCanvas"), r = $("mapView").getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
+  if (c.width !== W || c.height !== H) { c.width = W; c.height = H; map.cache = {}; }
+  return { c, W, H };
 }
+
+// Frames from the current one onward (a reused map can start in the past), every stepH hours.
+function mapFrames() {
+  const D = map.data, now = Date.now() / 1000, stride = Math.max(1, Math.round(T.stepH / (D.step_h || 3)));
+  let first = D.times.findIndex(t => t + (D.step_h || 3) * 1800 >= now); if (first < 0) first = 0;
+  const out = []; for (let i = first; i < D.times.length; i += stride) out.push(i); return out;
+}
+function renderDots(frames, cur) { $("mapDots").innerHTML = frames.map(f => `<i class="${f === cur ? "on" : ""}"></i>`).join(""); }
 
 function stepMap() {
   if (!map.on || !map.data) return;
   const frames = mapFrames();
-  let idx = frames.indexOf(map.frame);
-  idx = idx < 0 ? 0 : idx;
-  const f = frames[idx];
-  // quick fade in of the new frame's lines
-  const t0 = performance.now();
-  const fade = now => { const a = Math.min(1, (now - t0) / 250); drawMapFrame(f, a); if (a < 1 && map.on) requestAnimationFrame(fade); };
+  let idx = Math.max(0, frames.indexOf(map.frame));
+  const f = frames[idx], t0 = performance.now();
+  const fade = now => { const a = T.fadeMs ? Math.min(1, (now - t0) / T.fadeMs) : 1; drawMapFrame(f, a); if (a < 1 && map.on && map.frame !== f) requestAnimationFrame(fade); };
   requestAnimationFrame(fade);
   renderDots(frames, f);
   const last = idx === frames.length - 1;
   map.frame = frames[(idx + 1) % frames.length];
-  map.timer = setTimeout(stepMap, MAP_FRAME_MS + (last ? MAP_HOLD_MS : 0));
+  map.timer = setTimeout(stepMap, T.frameMs + (last ? T.holdMs : 0));
 }
+function redrawMap() { if (!map.on || !map.data) return; clearTimeout(map.timer); map.cache = {}; const frames = mapFrames(); if (!frames.includes(map.frame)) map.frame = frames[0]; stepMap(); }
 
 async function loadMap() {
-  const base = $("iUrl").value.trim().replace(/\/+$/, ""), island = $("sIsland").value;
-  for (const p of [`/map/${island}.json`, `/map/${island}`]) {
+  const base = $("iUrl").value.trim().replace(/\/+$/, "");
+  const key = T.area === "global" ? "global" : $("sIsland").value;
+  const landReady = loadLand(key === "global" ? "110m" : "50m");
+  for (const p of [`/map/${key}.json`, `/map/${key}`]) {
     try {
       const r = await fetch(base + p, { cache: "no-store" });
       if (!r.ok) continue;
-      map.data = await r.json(); map.island = island; map.cache = {}; map.frame = 0;
+      map.data = await r.json(); map.key = key; map.cache = {};
       const hs = map.data.h.flat(2).filter(v => v != null);
       map.hmin = Math.min(...hs); map.hmax = Math.max(...hs);
-      $("mapMin").textContent = `${map.hmin.toFixed(1)} m`; $("mapMax").textContent = `${map.hmax.toFixed(1)} m`;
       $("mapTitle").textContent = `${map.data.island.toUpperCase()} SWELL`;
-      document.querySelector(".ramp").style.background = `linear-gradient(90deg, ${[0, .25, .5, .75, 1].map(rainbow).join(",")})`;
-      serial(`[map] ${map.data.lats.length}x${map.data.lons.length} grid, ${map.data.times.length} frames every ${map.data.step_h || 3}h`);
+      serial(`[map] ${key}: ${map.data.lats.length}x${map.data.lons.length} grid, ${map.data.times.length} frames every ${map.data.step_h || 3}h`);
+      await landReady;
       return true;
     } catch { /* next */ }
   }
-  serial(`[map] no map data for ${island}`);
+  serial(`[map] no map data for ${key}`);
   return false;
 }
 
@@ -709,16 +845,60 @@ async function toggleMap(force) {
   $("bMap").classList.toggle("active", map.on);
   $("oledView").classList.toggle("hidden", map.on);
   $("mapView").classList.toggle("hidden", !map.on);
+  $("tuneCard").classList.toggle("hidden", !map.on);
   clearTimeout(map.timer);
   if (!map.on) return;
-  if (map.island !== $("sIsland").value && !(await loadMap())) { $("mapTitle").textContent = "NO MAP DATA"; return; }
-  map.frame = 0;
-  stepMap();
+  const key = T.area === "global" ? "global" : $("sIsland").value;
+  if (map.key !== key && !(await loadMap())) { $("mapTitle").textContent = "NO MAP DATA"; return; }
+  map.frame = -1;
+  redrawMap();
 }
-$("sMapStep").onchange = () => { if (map.on) { clearTimeout(map.timer); map.frame = 0; stepMap(); } };
+
+/* tuning panel */
+function buildTunePanel() {
+  const box = $("tuneGrid");
+  box.innerHTML = "";
+  for (const [key, label, a, b, step] of TUNE_SPEC) {
+    const wrap = document.createElement("div");
+    let input;
+    if (Array.isArray(a)) {
+      input = document.createElement("select");
+      input.innerHTML = a.map(v => `<option value="${v}">${v}</option>`).join("");
+      input.value = T[key];
+    } else if (a === "bool") {
+      input = document.createElement("input"); input.type = "checkbox"; input.checked = !!T[key];
+    } else if (a === "color") {
+      input = document.createElement("input"); input.type = "color"; input.value = T[key];
+    } else {
+      input = document.createElement("input"); input.type = "range"; input.min = a; input.max = b; input.step = step; input.value = T[key];
+    }
+    input.id = "t_" + key;
+    const out = document.createElement("span"); out.className = "tval";
+    const show = () => { out.textContent = input.type === "range" ? input.value : ""; };
+    show();
+    input.oninput = input.onchange = () => {
+      const v = input.type === "checkbox" ? input.checked : input.type === "range" ? +input.value
+              : typeof MAP_DEFAULTS[key] === "number" ? +input.value : input.value;
+      T[key] = v; show();
+      try { localStorage.setItem("surfsim.tune", JSON.stringify(T)); } catch {}
+      if (key === "area") { map.key = null; toggleMap(true); } else redrawMap();
+    };
+    wrap.innerHTML = `<label for="t_${key}">${label}</label>`;
+    const row = document.createElement("div"); row.className = "trow"; row.append(input, out);
+    wrap.append(row); box.append(wrap);
+  }
+}
+$("bTuneReset").onclick = () => { T = { ...MAP_DEFAULTS }; try { localStorage.removeItem("surfsim.tune"); } catch {} buildTunePanel(); map.key = null; if (map.on) toggleMap(true); };
+$("bTuneCopy").onclick = async () => {
+  const txt = JSON.stringify(T, null, 2);
+  try { await navigator.clipboard.writeText(txt); $("bTuneCopy").textContent = "Copied"; } catch { $("tuneOut").textContent = txt; }
+  setTimeout(() => { $("bTuneCopy").textContent = "Copy settings"; }, 1500);
+};
+buildTunePanel();
+
 $("bMap").onclick = () => toggleMap();
-document.addEventListener("keydown", e => { if (e.key === "m" && e.target.tagName !== "INPUT") toggleMap(); });
-setInterval(() => { if (map.on) loadMap(); }, 15 * 60 * 1000);   // same cadence as the device poll
+document.addEventListener("keydown", e => { if (e.key === "m" && !["INPUT", "SELECT"].includes(e.target.tagName)) toggleMap(); });
+setInterval(() => { if (map.on) loadMap().then(redrawMap); }, 15 * 60 * 1000);   // same cadence as the device poll
 
 restore();
 let last = performance.now();

@@ -6,3 +6,6 @@ __pycache__/
 site/
 .env
 CLAUDE.local.md
+.proxy.env
+.tunnel-url
+.relay/

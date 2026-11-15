@@ -57,28 +57,67 @@ activity. Re-enable from the Actions tab.
 **Schedule drift.** GitHub can delay cron runs by several minutes or skip one
 under load. Data covers 48h, so a missed hour is invisible.
 
-**Render (optional live API).** Same shared-IP 429 problem, plus a 30-60s cold
-start. `/debug/upstream` shows what Open-Meteo says over the route the app
-actually uses. `api_prox.py` is the old home-PC relay; it is not needed for the
-default setup.
+**Render (live API for the web app).** Shared-IP 429s (see "Home relay") plus
+a 30-60s cold start. `/debug/upstream` shows the route in use and what
+Open-Meteo says over it.
 
 ## Swell map (big-screen proof of concept)
 
-The hourly build writes `site/map/<island>.json`: swell height, direction and
-period on a ~1.5 degree grid, one frame every 3 hours for the next 48, from one
-Open-Meteo request (land comes back null and doubles as the coastline). The
-simulator's **Swell map** button (or `m`) draws it the way
-`scripts/ocean_swell_map.py` does: streamlines along the swell crests, coloured
-and thickened by height on one scale for all frames, stepping every 3 or 6
-hours ("Map step"). Map failures are logged in `status.json` (`map_failed`)
-but never fail the build.
+The build writes `site/map/<region>.json` for `bermuda`, `newquay` and `global`:
+swell height, direction and period on a coarse grid (2 degrees local, 10 degrees
+global), one frame every 3 hours for 48 hours. The map is stylised; it only
+needs to show a system coming. Maps rebuild every 6 hours (UTC 00/06/12/18) and
+off-cycle runs re-publish the previous copy (`SITE_URL` in the workflow).
+
+Open-Meteo counts every grid point as one call (confirmed by hitting the
+600/minute limit). Cost: ~670 calls per map rebuild, ~2,700 a day. Free tier
+allows 10,000 a day.
+
+The simulator's **Swell map** button (or `m`) draws it like
+`scripts/ocean_swell_map.py`: streamlines along the swell crests, coloured and
+thickened by height. Coastline is Natural Earth land as one outline (110m
+global, 50m local), loaded from the jsDelivr CDN, and lines are clipped to it.
+Map failures are logged in `status.json` (`map_failed`) and never fail the build.
+
+### Tweaking it
+
+```bash
+.venv/bin/python scripts/dev_server.py            # http://localhost:8090/sim/
+.venv/bin/python scripts/dev_server.py --refresh  # re-fetch data first
+```
+
+`/sim/` is served straight from `simulator/`, so code edits show on refresh.
+The **Map tuning** panel (visible while the map is on) changes line direction,
+density, step size, line lengths, seeding, interpolation, coast reach, widths,
+colours, colour scale, land style and timing live. "Copy settings" gives JSON
+to paste into `MAP_DEFAULTS` in `simulator/index.html` to make it the default.
 
 The readout is offshore swell. The OLED shows what reaches the chosen spot after
 shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
 
-Unverified: Open-Meteo may count each grid point against the daily quota
-(~230 points per island per hour). If the build starts seeing 429s, coarsen
-`MAP_REGIONS` in `swellmap.py` or build maps less often.
+## Home relay (temporary fix for 429s on Render)
+
+Render's shared IP runs out of Open-Meteo's free quota. Until there is an API
+key, the website's API can borrow your home connection:
+
+```bash
+python scripts/relay.py setup    # once: creates the switch (a secret gist), prints Render settings
+python scripts/relay.py on       # relay + Cloudflare tunnel + keep-awake; switch ON
+python scripts/relay.py status
+python scripts/relay.py off      # switch OFF, stop everything
+```
+
+- Render needs two env vars, set once: `RELAY_CONFIG_URL` (printed by
+  `setup`) and `PROXY_TOKEN` (from `.proxy.env`). Remove `OPEN_METEO_PROXY`.
+- The API reads the switch every minute. GitHub caches raw gists for a few
+  minutes, so on/off takes up to ~5 min to land.
+- You can flip `"enabled"` by editing the gist on github.com.
+- If the relay is unreachable (Mac asleep, tunnel restarted), the API falls
+  back to calling Open-Meteo directly, so the worst case is today's behaviour.
+- `scripts/dev_server.py` uses the local relay automatically when it is up,
+  so experiments share its 30-minute cache.
+- Everything shares your home IP's 10,000 calls/day. The real fix is an
+  Open-Meteo API key.
 
 ## Not yet true
 
