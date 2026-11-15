@@ -100,6 +100,18 @@ def stop(name: str) -> None:
     pid_file.unlink()
 
 
+def running_tunnel():
+    pid_file, log = STATE / "tunnel.pid", STATE / "tunnel.log"
+    if not (pid_file.exists() and log.exists()):
+        return None
+    try:
+        os.kill(int(pid_file.read_text()), 0)
+    except (ProcessLookupError, ValueError, PermissionError):
+        return None
+    m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log.read_text())
+    return m.group(0) if m else None
+
+
 # ── commands ────────────────────────────────────────────────────────────────
 def setup() -> None:
     cfg = load_cfg()
@@ -138,6 +150,14 @@ def on() -> None:
             sys.exit(f"relay did not start; see {STATE / 'relay.log'}")
     print("relay   ", local)
 
+    # Reuse a running tunnel that already answers (e.g. a rerun after DNS was slow).
+    url = running_tunnel()
+    if url and http_ok(f"{url}/health"):
+        print("tunnel  ", url, "(reused)")
+        write_switch(True, url)
+        print("switch   ON (Render picks it up within ~5 min: GitHub caches raw gists)")
+        return
+
     stop("tunnel")
     start("tunnel", ["cloudflared", "tunnel", "--no-autoupdate", "--url", local], {})
     url = None
@@ -149,12 +169,12 @@ def on() -> None:
         time.sleep(0.5)
     if not url:
         sys.exit(f"tunnel did not start; see {STATE / 'tunnel.log'}")
-    for _ in range(30):                       # new hostnames take a few seconds to resolve
+    for _ in range(60):                       # new hostnames can take a minute or two to resolve
         if http_ok(f"{url}/health"):
             break
-        time.sleep(2)
+        time.sleep(3)
     else:
-        sys.exit(f"tunnel {url} not reachable yet; try `status` in a minute")
+        sys.exit(f"tunnel {url} not reachable yet; rerun `on` in a minute (it will reuse this tunnel)")
     print("tunnel  ", url)
 
     write_switch(True, url)
