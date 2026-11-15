@@ -1,0 +1,7 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "api", "runtimeExecutable": ".venv/bin/uvicorn", "runtimeArgs": ["api:app", "--port", "8000"], "port": 8000 },
+    { "name": "static-site", "runtimeExecutable": ".venv/bin/python", "runtimeArgs": ["-m", "http.server", "8090", "-d", "site"], "port": 8090 }
+  ]
+}

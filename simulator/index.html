@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SURFMOD Simulator</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --line: #2a3038; --text: #d8dee6; --muted: #8a94a3;
+    --accent: #4fb3ff; --warn: #ffb547; --bad: #ff6b6b; --ok: #5bd18b;
+    --oled-off: #05070a; --oled-yellow: #ffd23f; --oled-blue: #53b9ff; --oled-white: #eef4ff;
+  }
+  :root[data-theme="light"] {
+    --bg: #f3f5f8; --panel: #ffffff; --line: #d9dee5; --text: #1b2028; --muted: #5d6775;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 16px; border-bottom: 1px solid var(--line); display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .04em; }
+  header span { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; max-width: 1180px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .device { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 22px 14px; }
+  .pcb { background: #12361f; border-radius: 12px; padding: 18px; box-shadow: inset 0 0 0 2px #1d4d2d; width: min(600px, 100%); }
+  .bezel { background: #000; padding: 10px; border-radius: 4px; }
+  canvas#oled { display: block; image-rendering: pixelated; width: 100%; max-width: 560px; height: auto; }
+  .status-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+  .pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+  .pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+  .controls { display: flex; flex-direction: column; gap: 14px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input[type=text], select { width: 100%; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line);
+         background: var(--bg); color: var(--text); font: inherit; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 0; min-width: 0; }
+  button { padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+           font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { border-color: var(--bad); color: var(--bad); }
+  .faults { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  pre#serial { margin: 0; height: 220px; overflow: auto; background: #07090c; color: #9fe7a8; border-radius: 6px; padding: 10px;
+               font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  .full { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  tr.cur td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  tr.past td { opacity: .4; }
+  .tablewrap { overflow-x: auto; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SURFMOD SIMULATOR</h1>
+  <span>Runs the same logic and layout as surf_oled.ino (v2). Change it here first, then port to the firmware.</span>
+</header>
+
+<main>
+  <section class="card device">
+    <div class="pcb"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
+    <div class="status-row">
+      <span class="pill" id="pWifi">wifi</span>
+      <span class="pill" id="pData">no data</span>
+      <span class="pill" id="pNext">next poll</span>
+      <span class="pill" id="pClock">clock</span>
+    </div>
+    <div class="row" style="width:100%;max-width:560px">
+      <button id="bPrev">◀ Prev</button>
+      <button id="bPoll">Poll now</button>
+      <button id="bNext">Next ▶</button>
+      <button id="bReset">Reboot</button>
+    </div>
+  </section>
+
+  <aside class="card controls">
+    <div>
+      <h2>Data source</h2>
+      <label for="iUrl">API_URL</label>
+      <input type="text" id="iUrl" spellcheck="false">
+      <p class="hint">Live API (http://localhost:8000) or static site (https://&lt;user&gt;.github.io/swellapi).</p>
+    </div>
+    <div class="row">
+      <div><label for="sIsland">ISLAND_KEY</label><select id="sIsland"><option>bermuda</option><option>newquay</option></select></div>
+      <div><label for="sSpot">Spot</label><select id="sSpot"><option value="">default</option></select></div>
+    </div>
+    <div class="row">
+      <div><label for="sHeight">Panel</label>
+        <select id="sHeight"><option value="64">128×64</option><option value="32">128×32</option></select></div>
+      <div><label for="sColor">Colour</label>
+        <select id="sColor"><option value="duo">Yellow/blue</option><option value="white">White</option><option value="blue">Blue</option></select></div>
+    </div>
+    <div>
+      <h2>Time</h2>
+      <div class="row">
+        <div><label for="sSpeed">Speed</label>
+          <select id="sSpeed"><option value="1">1×</option><option value="10">10×</option><option value="60">60×</option><option value="600">600×</option></select></div>
+        <div><label>Warp clock</label><div class="row"><button id="bWarp1">+1h</button><button id="bWarp6">+6h</button><button id="bWarp0">reset</button></div></div>
+      </div>
+    </div>
+    <div>
+      <h2>Faults</h2>
+      <div class="faults">
+        <button data-fault="wifi">WiFi down</button>
+        <button data-fault="dns">Bad host</button>
+        <button data-fault="http502">Server 502</button>
+        <button data-fault="json">Garbled JSON</button>
+        <button data-fault="slow">Cold start (30s)</button>
+        <button data-fault="ntp">No NTP</button>
+      </div>
+    </div>
+  </aside>
+
+  <section class="card full">
+    <h2>Serial monitor · 115200</h2>
+    <pre id="serial"></pre>
+  </section>
+
+  <section class="card full">
+    <h2>Blocks held in memory</h2>
+    <div class="tablewrap"><table id="tBlocks"><thead><tr>
+      <th>#</th><th>t</th><th>tag</th><th>q</th><th>r</th><th>h m</th><th>p s</th><th>swell</th><th>wind mph</th><th>wind</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+/* ───────────────────────── Adafruit GFX classic 5x7 font ─────────────────────────
+   5 column bytes per glyph, LSB = top row, ASCII 0x20..0x7E, 6px advance, 8px line. */
+const FONT_HEX =
+  "0000000000" + "00005F0000" + "0007000700" + "147F147F14" + "242A7F2A12" + "2313086462" + "3649562050" + "0008070300" +
+  "001C224100" + "0041221C00" + "2A1C7F1C2A" + "08083E0808" + "0080703000" + "0808080808" + "0000606000" + "2010080402" +
+  "3E5149453E" + "00427F4000" + "7249494946" + "2141494D33" + "1814127F10" + "2745454539" + "3C4A494931" + "4121110907" +
+  "3649494936" + "464949291E" + "0000140000" + "0040340000" + "0008142241" + "1414141414" + "0041221408" + "0201590906" +
+  "3E415D594E" + "7C1211127C" + "7F49494936" + "3E41414122" + "7F4141413E" + "7F49494941" + "7F09090901" + "3E41415173" +
+  "7F0808087F" + "00417F4100" + "2040413F01" + "7F08142241" + "7F40404040" + "7F021C027F" + "7F0408107F" + "3E4141413E" +
+  "7F09090906" + "3E4151215E" + "7F09192946" + "2649494932" + "03017F0103" + "3F4040403F" + "1F2040201F" + "3F4038403F" +
+  "6314081463" + "0304780403" + "6159494D43" + "007F414141" + "0204081020" + "004141417F" + "0402010204" + "4040404040" +
+  "0003070800" + "2054547840" + "7F28444438" + "3844444428" + "384444287F" + "3854545418" + "00087E0902" + "18A4A49C78" +
+  "7F08040478" + "00447D4000" + "2040403D00" + "7F10284400" + "00417F4000" + "7C04780478" + "7C08040478" + "3844444438" +
+  "FC18242418" + "18242418FC" + "7C08040408" + "4854545424" + "04043F4424" + "3C4040207C" + "1C2040201C" + "3C4030403C" +
+  "4428102844" + "4C9090907C" + "4464544C44" + "0008364100" + "0000770000" + "0041360800" + "0201020402";
+const FONT = new Uint8Array(FONT_HEX.length / 2);
+for (let i = 0; i < FONT.length; i++) FONT[i] = parseInt(FONT_HEX.substr(i * 2, 2), 16);
+
+/* ───────────────────────── Minimal SSD1306 + Adafruit_GFX ───────────────────────── */
+class Display {
+  constructor(w, h) { this.w = w; this.h = h; this.buf = new Uint8Array(w * h); this.cx = 0; this.cy = 0; this.size = 1; }
+  clearDisplay() { this.buf.fill(0); }
+  px(x, y) { if (x >= 0 && y >= 0 && x < this.w && y < this.h) this.buf[y * this.w + x] = 1; }
+  fillRect(x, y, w, h) { for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) this.px(x + i, y + j); }
+  drawRect(x, y, w, h) { this.fillRect(x, y, w, 1); this.fillRect(x, y + h - 1, w, 1); this.fillRect(x, y, 1, h); this.fillRect(x + w - 1, y, 1, h); }
+  drawFastHLine(x, y, w) { this.fillRect(x, y, w, 1); }
+  setTextSize(s) { this.size = s; }
+  setCursor(x, y) { this.cx = x; this.cy = y; }
+  drawChar(x, y, c, s) {
+    const code = c.charCodeAt(0);
+    if (code < 0x20 || code > 0x7E) return;
+    const o = (code - 0x20) * 5;
+    for (let col = 0; col < 5; col++) {
+      const bits = FONT[o + col];
+      for (let row = 0; row < 8; row++) if (bits & (1 << row)) this.fillRect(x + col * s, y + row * s, s, s);
+    }
+  }
+  print(str) {                                  // Adafruit default: wrap on
+    for (const c of String(str)) {
+      if (c === "\n") { this.cx = 0; this.cy += 8 * this.size; continue; }
+      if (this.cx + 6 * this.size > this.w) { this.cx = 0; this.cy += 8 * this.size; }
+      this.drawChar(this.cx, this.cy, c, this.size);
+      this.cx += 6 * this.size;
+    }
+  }
+}
+
+/* ───────────────────────── Firmware port (keep in sync with surf_oled.ino) ───────────────────────── */
+const REFRESH_MS = 15 * 60 * 1000;
+const BACKOFF_MS = [60000, 120000, 240000, 480000, 900000];
+const PAGE_MS = 4000;
+const STALE_S = 3 * 3600;
+const BLOCK_S = 3 * 3600;
+const MAX_BLOCKS = 16;
+
+function layout(height) {
+  return height >= 64
+    ? { Y_QUALITY: 0, Y_TAG: 0, Y_TIME: 8, Y_RULE: 17, Y_BIG: 21, Y_DET: 25, Y_WIND: 40, Y_BAR: 54, BAR_H: 8, COMPACT: false }
+    : { Y_QUALITY: 0, Y_TAG: 0, Y_TIME: 8, Y_RULE: 15, Y_BIG: 16, Y_DET: 16, Y_WIND: 24, Y_BAR: 0, BAR_H: 0, COMPACT: true };
+}
+const X_RIGHT = 86, X_DET = 56, X_WARN = 122;
+
+const $ = id => document.getElementById(id);
+const faults = new Set();
+let display, L;
+let dev;                       // device state, reset on reboot
+let simMs = 0;                 // millis() since boot
+let bootUnix = Date.now() / 1000;
+let warpS = 0;
+let busy = false;
+
+function freshDevice() {
+  return { spotName: "Surf", blocks: [], generatedAt: 0, lastPoll: 0, lastPage: 0, page: 0, failStreak: 0,
+           lastError: "", wifi: false };
+}
+
+const nowUnix = () => faults.has("ntp") || !dev.wifiEverUp ? 0 : Math.floor(bootUnix + simMs / 1000 + warpS);
+const fmt = (v, d) => (v ?? 0).toFixed(d);
+
+function serial(line) {
+  const el = $("serial");
+  const t = (simMs / 1000).toFixed(1).padStart(8, " ");
+  el.textContent += `[${t}] ${line}\n`;
+  if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
+  el.scrollTop = el.scrollHeight;
+}
+
+function showStatus(l1, l2) {
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0, 0); display.print(l1);
+  if (l2) { display.setCursor(0, 12); display.print(l2); }
+  paint();
+}
+
+function buildUrl() {
+  let u = $("iUrl").value.trim(), https = true;
+  if (u.startsWith("https://")) u = u.slice(8);
+  else if (u.startsWith("http://")) { u = u.slice(7); https = false; }
+  u = u.replace(/\/+$/, "");
+  const slash = u.indexOf("/");
+  const host = slash >= 0 ? u.slice(0, slash) : u;
+  const prefix = slash >= 0 ? u.slice(slash + 1) : "";
+  const spot = $("sSpot").value;
+  // The firmware only knows /esp/<island>. Per-spot is a simulator extra:
+  // live API takes ?spot=, the static site has esp/spots/<island>/<spot>.json.
+  let path = `/esp/${$("sIsland").value}?blocks=${MAX_BLOCKS}`;
+  if (spot) path += `&spot=${spot}`;
+  return { host, url: `${https ? "https" : "http"}://${host}${prefix ? "/" + prefix : ""}${path}`,
+           staticSpotUrl: spot ? `${https ? "https" : "http"}://${host}${prefix ? "/" + prefix : ""}/esp/spots/${$("sIsland").value}/${spot}.json` : null };
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function ensureWifi() {
+  if (dev.wifi && !faults.has("wifi")) return true;
+  if (!dev.blocks.length) showStatus("Connecting WiFi", "sim-wifi");
+  await sleep(300);
+  if (faults.has("wifi")) { dev.wifi = false; dev.lastError = "wifi failed"; return false; }
+  dev.wifi = true; dev.wifiEverUp = true;
+  return true;
+}
+
+async function pollForecast() {
+  if (!(await ensureWifi())) return false;
+  const { host, url, staticSpotUrl } = buildUrl();
+  serial(`GET ${url}`);
+  if (!host || faults.has("dns")) { dev.lastError = "DNS fail: bad host?"; return false; }
+  if (faults.has("slow")) { serial("waiting on cold start..."); await sleep(30000 / Math.min(+$("sSpeed").value, 30)); }
+
+  let body;
+  try {
+    if (faults.has("http502")) { dev.lastError = "HTTP 502"; serial("GET failed: 502"); return false; }
+    let res = await fetch(url, { cache: "no-store" });
+    if (res.status === 404 && staticSpotUrl) res = await fetch(staticSpotUrl, { cache: "no-store" });
+    if (res.status !== 200) { dev.lastError = `HTTP ${res.status}`; serial(`GET failed: ${res.status}`); return false; }
+    body = await res.text();
+  } catch (e) {
+    dev.lastError = "HTTP -1"; serial(`GET failed: -1 connection refused (${e.message})`); return false;
+  }
+  if (faults.has("json")) body = body.slice(0, body.length / 2);
+
+  let doc;
+  try { doc = JSON.parse(body); } catch { dev.lastError = "json InvalidInput"; return false; }
+
+  const fresh = (doc.b || []).slice(0, MAX_BLOCKS).map(b => ({
+    timeLabel: b.t ?? "--", quality: b.q ?? "--", swellDir: b.sd ?? "--", windDir: b.wd ?? "--",
+    start: b.e ?? 0, hoursFromNow: b.hn ?? 0,
+    swellHeight: b.h ?? 0, swellPeriod: b.p ?? 0, windSpeed: b.w ?? 0, rating: b.r ?? 0,
+  }));
+  if (!fresh.length) { dev.lastError = "empty forecast"; return false; }
+
+  dev.blocks = fresh;
+  dev.generatedAt = doc.gt ?? 0;
+  dev.spotName = (doc.s ?? "Surf").slice(0, 19);
+  dev.lastError = "";
+  serial(`ok: ${fresh.length} blocks for ${dev.spotName}`);
+  return true;
+}
+
+const blockVisible = (v, now) => now === 0 || v.start === 0 || v.start + BLOCK_S > now;
+function nextVisible(from, now) {
+  const n = dev.blocks.length;
+  for (let i = 0; i < n; i++) { const idx = (from + i) % n; if (blockVisible(dev.blocks[idx], now)) return idx; }
+  return -1;
+}
+function tagFor(v, now) {
+  let hrs = v.hoursFromNow;
+  if (now && v.start) hrs = v.start > now ? Math.floor((v.start - now + 1799) / 3600) : 0;
+  return hrs <= 0 ? " NOW" : ` +${hrs}h`;
+}
+
+function drawBlock(v, now, warn) {
+  display.clearDisplay();
+  display.setTextSize(2); display.setCursor(0, L.Y_QUALITY); display.print(v.quality);
+  display.setTextSize(1);
+  display.setCursor(X_RIGHT, L.Y_TAG); display.print(tagFor(v, now));
+  display.setCursor(X_RIGHT, L.Y_TIME); display.print(v.timeLabel);
+  if (warn) { display.setCursor(X_WARN, L.Y_TAG); display.print("!"); }
+  display.drawFastHLine(0, L.Y_RULE, display.w);
+
+  if (L.COMPACT) {
+    display.setCursor(0, L.Y_BIG);
+    display.print(`${fmt(v.swellHeight, 1)}m ${fmt(v.swellPeriod, 0)}s ${v.swellDir}`);
+    display.setCursor(0, L.Y_WIND);
+    display.print(`W ${fmt(v.windSpeed, 0)}mph ${v.windDir}  ${Math.trunc(v.rating * 100)}%`);
+  } else {
+    display.setTextSize(2); display.setCursor(0, L.Y_BIG); display.print(`${fmt(v.swellHeight, 1)}m`);
+    display.setTextSize(1); display.setCursor(X_DET, L.Y_DET); display.print(`${fmt(v.swellPeriod, 0)}s ${v.swellDir}`);
+    display.setCursor(0, L.Y_WIND); display.print(`WND ${fmt(v.windSpeed, 0)}mph ${v.windDir}`);
+    const barW = Math.max(2, Math.min(display.w, Math.trunc(v.rating * display.w)));
+    display.drawRect(0, L.Y_BAR, display.w, L.BAR_H);
+    display.fillRect(0, L.Y_BAR, barW, L.BAR_H);
+  }
+  paint();
+}
+
+function drawPage() {
+  const now = nowUnix();
+  const idx = dev.blocks.length ? nextVisible(dev.page, now) : -1;
+  if (idx < 0) {
+    showStatus(dev.blocks.length ? "Forecast expired" : "No forecast data", dev.lastError || "retrying...");
+    renderTable(now, -1);
+    return;
+  }
+  dev.page = idx;
+  const stale = !!dev.lastError || (now && dev.generatedAt && now - dev.generatedAt > STALE_S);
+  drawBlock(dev.blocks[idx], now, stale);
+  renderTable(now, idx);
+}
+
+const pollInterval = () => dev.failStreak === 0 ? REFRESH_MS : BACKOFF_MS[Math.min(dev.failStreak - 1, 4)];
+
+async function doPoll() {
+  busy = true;
+  if (!dev.blocks.length) showStatus("Updating...", dev.spotName);
+  if (await pollForecast()) { dev.failStreak = 0; dev.page = 0; }
+  else { dev.failStreak = Math.min(255, dev.failStreak + 1); serial(`poll failed (${dev.failStreak} in a row): ${dev.lastError}`); }
+  dev.lastPoll = dev.lastPage = simMs;
+  busy = false;
+  drawPage();
+}
+
+async function setup() {
+  dev = freshDevice(); simMs = 0; bootUnix = Date.now() / 1000;
+  L = layout(+$("sHeight").value);
+  display = new Display(128, +$("sHeight").value);
+  $("oled").height = display.h;
+  $("serial").textContent = "";
+  serial(`SURFMOD v2 boot, panel 128x${display.h}`);
+  showStatus("SURFMOD v2", "booting...");
+  busy = true;
+  dev.failStreak = (await pollForecast()) ? 0 : 1;
+  if (dev.failStreak) serial(`poll failed: ${dev.lastError}`);
+  dev.lastPoll = dev.lastPage = simMs; dev.page = 0;
+  busy = false;
+  drawPage();
+}
+
+function loop() {
+  if (busy) return;
+  if (simMs - dev.lastPoll >= pollInterval()) { doPoll(); return; }
+  if (simMs - dev.lastPage >= PAGE_MS) {
+    dev.page = dev.blocks.length ? (dev.page + 1) % dev.blocks.length : 0;
+    dev.lastPage = simMs;
+    drawPage();
+  }
+}
+
+/* ───────────────────────── Rendering + UI ───────────────────────── */
+function paint() {
+  const cv = $("oled"), ctx = cv.getContext("2d");
+  const css = getComputedStyle(document.documentElement);
+  const mode = $("sColor").value;
+  const yellow = css.getPropertyValue("--oled-yellow"), blue = css.getPropertyValue("--oled-blue");
+  const white = css.getPropertyValue("--oled-white");
+  ctx.fillStyle = css.getPropertyValue("--oled-off");
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  for (let y = 0; y < display.h; y++) {
+    ctx.fillStyle = mode === "white" ? white : mode === "blue" ? blue : (y < 16 ? yellow : blue);
+    for (let x = 0; x < display.w; x++) if (display.buf[y * display.w + x]) ctx.fillRect(x, y, 1, 1);
+  }
+}
+
+function renderTable(now, cur) {
+  const tb = $("tBlocks").tBodies[0];
+  tb.innerHTML = "";
+  dev.blocks.forEach((v, i) => {
+    const tr = tb.insertRow();
+    if (i === cur) tr.className = "cur"; else if (!blockVisible(v, now)) tr.className = "past";
+    [i, v.timeLabel, tagFor(v, now).trim(), v.quality, fmt(v.rating, 2), fmt(v.swellHeight, 2), fmt(v.swellPeriod, 1),
+     v.swellDir, fmt(v.windSpeed, 1), v.windDir].forEach(c => { tr.insertCell().textContent = c; });
+  });
+}
+
+function setPill(id, text, cls) { const el = $(id); el.textContent = text; el.className = "pill " + (cls || ""); }
+function updatePills() {
+  if (!dev) return;
+  const now = nowUnix();
+  setPill("pWifi", dev.wifi && !faults.has("wifi") ? "wifi up" : "wifi down", dev.wifi && !faults.has("wifi") ? "ok" : "bad");
+  if (!dev.blocks.length) setPill("pData", dev.lastError ? `no data: ${dev.lastError}` : "no data", "bad");
+  else {
+    const age = now && dev.generatedAt ? Math.round((now - dev.generatedAt) / 60) : null;
+    const txt = age === null ? "data age ?" : age < 120 ? `data ${age} min old` : `data ${(age / 60).toFixed(1)} h old`;
+    setPill("pData", dev.lastError ? `${txt} · last poll: ${dev.lastError}` : txt,
+            dev.lastError || (age !== null && age * 60 > STALE_S) ? "warn" : "ok");
+  }
+  const left = Math.max(0, pollInterval() - (simMs - dev.lastPoll));
+  setPill("pNext", busy ? "polling..." : `next poll ${Math.ceil(left / 1000)}s`, dev.failStreak ? "warn" : "");
+  setPill("pClock", now ? new Date(now * 1000).toISOString().slice(5, 16).replace("T", " ") + " UTC" : "no NTP", now ? "" : "warn");
+}
+
+function defaultUrl() {
+  const { protocol, origin, pathname } = location;
+  if (protocol === "file:") return "http://localhost:8000";
+  const i = pathname.indexOf("/sim");
+  return origin + (i >= 0 ? pathname.slice(0, i) : "");
+}
+
+async function loadIslands() {
+  const base = $("iUrl").value.trim().replace(/\/+$/, "");
+  for (const p of ["/islands", "/islands.json"]) {
+    try {
+      const r = await fetch(base + p); if (!r.ok) continue;
+      const { islands } = await r.json();
+      const keep = $("sIsland").value;
+      $("sIsland").innerHTML = Object.keys(islands).map(k => `<option>${k}</option>`).join("");
+      if (islands[keep]) $("sIsland").value = keep;
+      window._islands = islands; fillSpots(); return;
+    } catch { /* try next */ }
+  }
+}
+function fillSpots() {
+  const spots = window._islands?.[$("sIsland").value]?.spots || [];
+  $("sSpot").innerHTML = `<option value="">default</option>` + spots.map(s => `<option>${s}</option>`).join("");
+}
+
+function persist() {
+  try { localStorage.setItem("surfsim", JSON.stringify({ url: $("iUrl").value, island: $("sIsland").value,
+        h: $("sHeight").value, c: $("sColor").value })); } catch {}
+}
+function restore() {
+  let s = {};
+  try { s = JSON.parse(localStorage.getItem("surfsim") || "{}"); } catch {}
+  $("iUrl").value = s.url || defaultUrl();
+  if (s.h) $("sHeight").value = s.h;
+  if (s.c) $("sColor").value = s.c;
+  if (s.island) $("sIsland").value = s.island;
+}
+
+document.querySelectorAll("[data-fault]").forEach(b => b.addEventListener("click", () => {
+  const f = b.dataset.fault;
+  faults.has(f) ? faults.delete(f) : faults.add(f);
+  b.classList.toggle("on", faults.has(f));
+  serial(`[sim] fault ${f} ${faults.has(f) ? "ON" : "off"}`);
+  if (f === "wifi" && faults.has(f)) dev.wifi = false;
+  drawPage();
+}));
+$("bPoll").onclick = () => { if (!busy) doPoll(); };
+$("bNext").onclick = () => { if (dev.blocks.length) { dev.page = (dev.page + 1) % dev.blocks.length; dev.lastPage = simMs; drawPage(); } };
+$("bPrev").onclick = () => {
+  const n = dev.blocks.length, now = nowUnix(); if (!n) return;
+  let i = dev.page; for (let k = 0; k < n; k++) { i = (i - 1 + n) % n; if (blockVisible(dev.blocks[i], now)) break; }
+  dev.page = i; dev.lastPage = simMs; drawPage();
+};
+$("bReset").onclick = () => setup();
+$("bWarp1").onclick = () => { warpS += 3600; serial("[sim] clock +1h"); drawPage(); };
+$("bWarp6").onclick = () => { warpS += 6 * 3600; serial("[sim] clock +6h"); drawPage(); };
+$("bWarp0").onclick = () => { warpS = 0; serial("[sim] clock reset"); drawPage(); };
+$("sHeight").onchange = () => { persist(); setup(); };
+$("sColor").onchange = () => { persist(); paint(); };
+$("sIsland").onchange = () => { persist(); fillSpots(); setup(); };
+$("sSpot").onchange = () => setup();
+$("iUrl").onchange = () => { persist(); loadIslands(); setup(); };
+
+restore();
+let last = performance.now();
+setInterval(() => {
+  const t = performance.now();
+  simMs += (t - last) * +$("sSpeed").value;
+  last = t;
+  if (dev) { loop(); updatePills(); }
+}, 50);
+loadIslands().finally(setup);
+</script>
+</body>
+</html>

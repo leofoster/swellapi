@@ -1,3 +1,10 @@
+# Optional: the live API. The default setup is the static site built hourly by
+# .github/workflows/publish.yml, which does not need Render at all.
+#
+# On Render's free tier Open-Meteo often answers 429: Render's outbound IPs are
+# shared, and other tenants use up the per-IP daily quota. Responses are cached
+# for 30 min (OPEN_METEO_CACHE_TTL), which helps but cannot fix a quota that
+# someone else has already spent.
 services:
   - type: web
     name: surf-api
@@ -6,10 +13,9 @@ services:
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
     plan: free
     envVars:
-      # Open-Meteo's free tier rejects Render's shared datacenter IPs, so
-      # upstream calls are routed through api_prox.py on a home connection.
-      # Set both in the Render dashboard; sync:false keeps them out of git.
-      # Unset OPEN_METEO_PROXY to go back to calling Open-Meteo directly.
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      # Optional relay through api_prox.py. Leave unset to call Open-Meteo directly.
       - key: OPEN_METEO_PROXY
         sync: false
       - key: PROXY_TOKEN

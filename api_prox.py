@@ -1,4 +1,8 @@
-# api_prox.py — residential proxy for Open-Meteo
+# api_prox.py — residential proxy for Open-Meteo (LEGACY / optional)
+#
+# No longer needed for the default setup: the GitHub Actions + Pages build
+# (scripts/build_static.py) calls Open-Meteo directly. Kept for anyone running
+# the live API on a host whose shared IP is rate limited.
 #
 # Open-Meteo's free tier rejects calls from Render's shared datacenter IPs, so
 # the deployed API routes its upstream requests through this process running on
@@ -21,6 +25,7 @@
 # PROXY_TOKEN to require a matching X-Proxy-Token header so it is not an open
 # relay for someone else's traffic against your IP's rate limit.
 
+import hmac
 import os
 import time
 import threading
@@ -49,7 +54,7 @@ app = FastAPI(title="Open-Meteo residential proxy")
 
 
 def _check_token(request: Request) -> None:
-    if PROXY_TOKEN and request.headers.get("X-Proxy-Token") != PROXY_TOKEN:
+    if PROXY_TOKEN and not hmac.compare_digest(request.headers.get("X-Proxy-Token", ""), PROXY_TOKEN):
         raise HTTPException(status_code=401, detail="bad or missing X-Proxy-Token")
 
 
