@@ -61,9 +61,16 @@
   .dots i { width: 6px; height: 6px; border-radius: 50%; background: #555; }
   .dots i.on { background: #e0e0e0; width: 9px; height: 9px; }
   .hidden { display: none !important; }
-  .lwframe { width: 100%; max-width: 992px; aspect-ratio: 1240 / 540; border-radius: 10px; overflow: hidden; background: #05080d;
-             box-shadow: 0 0 0 8px #0a0c10, 0 10px 40px rgba(0,0,0,.45); }
-  .lwframe canvas { display: block; width: 100%; height: 100%; }
+  .lwframe { position: relative; width: 100%; max-width: 992px; aspect-ratio: 1240 / 540; border-radius: 10px; overflow: hidden;
+             background: #05080d; box-shadow: 0 0 0 8px #0a0c10, 0 10px 40px rgba(0,0,0,.45); }
+  .lwframe canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+  .lwhud { position: absolute; left: 0; right: 0; top: 0; display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+           padding: 10px 14px; background: linear-gradient(#000a, #0000); color: #c9d1d9; font-size: clamp(10px, 1.6vw, 13px); pointer-events: none; }
+  .lwhud b { color: #e6edf3; font-size: clamp(12px, 2.2vw, 18px); white-space: nowrap; }
+  .lwhud span { text-align: right; }
+  .lwfoot { position: absolute; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; gap: 12px; padding: 4px 10px;
+            background: #0008; color: #8b949e; font-size: 10px; pointer-events: none; }
+  #lwPerf { color: #ffd23f; font-weight: 600; }
   .sqframe { width: min(560px, 100%); aspect-ratio: 1; padding: 18px; border-radius: 22px; background: #1b1f24;
              box-shadow: inset 0 0 0 1px #2d333b, 0 14px 40px rgba(0,0,0,.45); cursor: pointer; }
   .sqframe canvas { display: block; width: 100%; height: 100%; border-radius: 6px; background: #0b0f14; }
@@ -93,7 +100,11 @@
   <section class="card device">
     <div class="pcb" id="oledView"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
     <div class="sqframe hidden" id="sqView" title="Click to change page"><canvas id="sq" width="720" height="720"></canvas></div>
-    <div class="lwframe hidden" id="liveView"><canvas id="lwCanvas" width="1240" height="540"></canvas></div>
+    <div class="lwframe hidden" id="liveView">
+      <canvas id="lwBg" width="1240" height="540"></canvas><canvas id="lwCanvas" width="1240" height="540"></canvas>
+      <div class="lwhud"><b id="lwName"></b><span id="lwInfo"></span></div>
+      <div class="lwfoot"><span id="lwPerf"></span><span id="lwFoot"></span></div>
+    </div>
     <div class="screen hidden" id="mapView">
       <canvas id="mapCanvas"></canvas>
       <div class="hud"><span id="mapTitle">SWELL</span><small id="mapTime"></small></div>
@@ -157,7 +168,8 @@
   <section class="card full hidden" id="lwCard">
     <h2>Live wave</h2>
     <div class="tunegrid">
-      <div><label for="lwPreset">Break</label><select id="lwPreset"></select></div>
+      <div><label for="lwPreset">Break (<kbd>[</kbd> <kbd>]</kbd> to step)</label><div class="trow">
+        <button id="lwPrevBreak" title="Previous break">◀</button><select id="lwPreset"></select><button id="lwNextBreak" title="Next break">▶</button></div></div>
       <div><label for="lwLat">Latitude</label><input type="text" id="lwLat"></div>
       <div><label for="lwLon">Longitude</label><input type="text" id="lwLon"></div>
       <div><label for="lwBreak">Break type</label><select id="lwBreak"><option>beach</option><option>reef</option><option>point</option><option>rivermouth</option></select></div>
@@ -175,7 +187,8 @@
       <div><label for="lwWindDir">Wind from (deg)</label><div class="trow"><input type="range" id="lwWindDir" min="0" max="359" step="1" value="0"></div></div>
       <div><label for="lwTide">Tide (0 low, 1 high)</label><div class="trow"><input type="range" id="lwTide" min="0" max="1" step="0.05" value="0.5"></div></div>
     </div>
-    <p class="hint">Waves come from the forecast at the pin (live API) unless overridden. The engine knobs (slope, peel and foam per break type, shoaling, set length, sea/land darkening) are <code>BREAKS</code> and <code>DEFAULTS</code> in simulator/livewave.js, the same file the web app uses.</p>
+    <p class="hint">Pick a break, step through them with ◀ ▶ (or <kbd>[</kbd> <kbd>]</kbd>), or type any latitude/longitude and press Enter. The address bar link (<code>#live=lat,lon,type</code>) reopens that exact pin. Preset positions are approximate.
+    Waves come from the forecast at the pin (live API) unless overridden. The engine knobs (slope, peel and foam per break type, shoaling, set length, sea/land darkening) are <code>BREAKS</code> and <code>DEFAULTS</code> in simulator/livewave.js, the same file the web app uses.</p>
   </section>
 
   <section class="card full hidden" id="tuneCard">
@@ -411,6 +424,7 @@ function drawBlock(v, now, warn) {
 }
 
 function drawPage() {
+  if (map.on || lw.on) { clearTimeout(sq.mapTimer); return; }   // device screen hidden: don't draw it
   const now = nowUnix();
   if (isSq()) {
     const vis = dev.blocks.length ? nextVisible(0, now) : -1;
@@ -466,10 +480,10 @@ function loop() {
   if (busy) return;
   if (simMs - dev.lastPoll >= pollInterval()) { doPoll(); return; }
   if (isSq()) {
-    if (!map.on && simMs - dev.lastPage >= sqPageMs()) { sqGo(1); }
+    if (!map.on && !lw.on && simMs - dev.lastPage >= sqPageMs()) { sqGo(1); }
     return;
   }
-  if (simMs - dev.lastPage >= PAGE_MS) {
+  if (!map.on && !lw.on && simMs - dev.lastPage >= PAGE_MS) {
     dev.page = dev.blocks.length ? (dev.page + 1) % dev.blocks.length : 0;
     dev.lastPage = simMs;
     drawPage();
@@ -653,7 +667,7 @@ function sqDraw(now) {
   else {
     sqMap(ctx, now, token).then(ok => { if (ok && token === sq.token) sqDots($("sq").getContext("2d")); });
     const frames = map.data ? mapFrames() : [];
-    sq.mapTimer = setTimeout(() => { sq.mapIdx = (sq.mapIdx + 1) % Math.max(1, frames.length); if (SQ_PAGES[sq.page] === "map") sqDraw(nowUnix()); },
+    sq.mapTimer = setTimeout(() => { sq.mapIdx = (sq.mapIdx + 1) % Math.max(1, frames.length); if (SQ_PAGES[sq.page] === "map" && !map.on && !lw.on) sqDraw(nowUnix()); },
                              T.frameMs + (sq.mapIdx === frames.length - 1 ? T.holdMs : 0));
     return;
   }
@@ -1166,14 +1180,43 @@ setInterval(() => { if (map.on) loadMap().then(redrawMap); }, 15 * 60 * 1000);  
    copies: buildGeo -> paramsFromHour -> draw. This file only adds the controls,
    the forecast fetch and the read-out. */
 const LW_W = 1240, LW_H = 540;
-const LW_PRESETS = [   // approximate break positions; type your own lat/lon for anything else
-  ["Southlands, Bermuda", 32.2537, -64.8243, "reef"],
-  ["Pipeline, Oahu", 21.6650, -158.0530, "reef"],
-  ["La Gravière, Hossegor", 43.6730, -1.4450, "beach"],
-  ["Supertubes, J-Bay", -34.0320, 24.9310, "point"],
-  ["Fistral, Newquay", 50.4170, -5.1010, "beach"],
-  ["Uluwatu, Bali", -8.8150, 115.0870, "reef"],
-];
+// Approximate positions (to ~100 m) of well-known breaks, for testing the scene on many
+// coastlines and break types. Not a spot database. Type any lat/lon for anything else.
+const LW_PRESETS = [
+  ["Hawaii & Pacific", [
+    ["Pipeline, Oahu", 21.6650, -158.0530, "reef"], ["Waimea Bay, Oahu", 21.6420, -158.0660, "reef"],
+    ["Jaws (Peʻahi), Maui", 20.9420, -156.2970, "reef"], ["Teahupoʻo, Tahiti", -17.8590, -149.2600, "reef"],
+    ["Cloud 9, Siargao", 9.8130, 126.1660, "reef"]]],
+  ["North America", [
+    ["Mavericks, CA", 37.4920, -122.5010, "reef"], ["Ocean Beach, San Francisco", 37.7600, -122.5110, "beach"],
+    ["Steamer Lane, Santa Cruz", 36.9510, -122.0260, "point"], ["Rincon, CA", 34.3730, -119.4770, "point"],
+    ["Malibu, CA", 34.0350, -118.6780, "point"], ["Lower Trestles, CA", 33.3820, -117.5880, "point"],
+    ["Cape Hatteras, NC", 35.2230, -75.5290, "beach"], ["Ditch Plains, Montauk", 41.0400, -71.9200, "point"],
+    ["Puerto Escondido, Mexico", 15.8600, -97.0700, "beach"]]],
+  ["Caribbean & Atlantic islands", [
+    ["Southlands, Bermuda", 32.2537, -64.8243, "reef"], ["Tres Palmas, Puerto Rico", 18.3530, -67.2610, "reef"],
+    ["Soup Bowl, Barbados", 13.2190, -59.5220, "reef"]]],
+  ["Europe", [
+    ["Nazaré, Portugal", 39.6050, -9.0870, "beach"], ["Supertubos, Peniche", 39.3460, -9.3630, "beach"],
+    ["La Gravière, Hossegor", 43.6730, -1.4450, "beach"], ["Mundaka, Spain", 43.4080, -2.6970, "rivermouth"],
+    ["Fistral, Newquay", 50.4170, -5.1010, "beach"], ["Thurso East, Scotland", 58.5950, -3.5100, "reef"],
+    ["Bundoran Peak, Ireland", 54.4800, -8.2830, "reef"], ["Mullaghmore, Ireland", 54.4730, -8.4530, "reef"]]],
+  ["Africa", [
+    ["Supertubes, J-Bay", -34.0320, 24.9310, "point"], ["Muizenberg, Cape Town", -34.1080, 18.4730, "beach"],
+    ["Skeleton Bay, Namibia", -22.6930, 14.5280, "point"], ["Anchor Point, Morocco", 30.5450, -9.7270, "point"]]],
+  ["Indonesia & Asia", [
+    ["Uluwatu, Bali", -8.8150, 115.0870, "reef"], ["Padang Padang, Bali", -8.8110, 115.1030, "reef"],
+    ["G-Land, Java", -8.7360, 114.3600, "reef"], ["Ichinomiya, Japan", 35.3730, 140.3880, "beach"]]],
+  ["Australia & NZ", [
+    ["Snapper Rocks, Gold Coast", -28.1630, 153.5500, "point"], ["Bells Beach, Victoria", -38.3700, 144.2820, "reef"],
+    ["Margaret River, WA", -33.9750, 114.9810, "reef"], ["Manu Bay, Raglan", -37.8200, 174.8130, "point"]]],
+  ["South America", [
+    ["Chicama, Peru", -7.7020, -79.4400, "point"], ["Punta de Lobos, Chile", -34.4330, -72.0450, "point"],
+    ["Saquarema, Brazil", -22.9330, -42.4930, "beach"]]],
+  ["Edge cases", [
+    ["Lake Michigan (no ocean: generic beach)", 43.7500, -87.7000, "beach"],
+    ["Open Pacific (no coast: generic beach)", 10.0000, -140.0000, "beach"]]],
+].flatMap(([region, list]) => list.map(x => [...x, region]));
 const LW_COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
 const lw = { on: false, raf: 0, key: null, geo: null, hour: null, dayHours: null, src: "none", params: null, t: 0, last: 0, M: null, status: "" };
 const lwVal = id => $(id).value;
@@ -1186,7 +1229,7 @@ async function lwBuild() {
   const M = await lwMod();
   const geo = await M.buildGeo({ lat, lon, width: LW_W, height: LW_H, opts: { zoom: z } });
   if (lw.key !== key) return;
-  lw.geo = geo; lw.params = null;
+  lw.geo = geo; lw.params = null; lw.bgKey = null;
   lw.status = geo.status === "synthetic" ? "No coastline found here: showing a generic beach" : "";
   serial(`[live] ${geo.shores.length} shoreline runs (${geo.status}), ${geo.mpp.toFixed(2)} m/px`);
 }
@@ -1228,25 +1271,32 @@ function lwCurrentParams() {
 
 function lwFrame(ts) {
   if (!lw.on) return;
-  const c = $("lwCanvas"), ctx = c.getContext("2d");
+  const bg = $("lwBg"), cv = $("lwCanvas"), ctx = cv.getContext("2d");
   const dt = Math.min(0.05, (ts - (lw.last || ts)) / 1000); lw.last = ts;
   lw.t += dt * +lwVal("lwSpeed");
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  const p = lwCurrentParams();
+  const p = lwCurrentParams(), debug = $("lwDebug").checked;
+  if (!p) { bg.getContext("2d").fillRect(0, 0, LW_W, LW_H); lw.raf = requestAnimationFrame(lwFrame); lwHud(null); return; }
+  // backdrop canvas: only when something it shows changed
+  const bgKey = `${lw.key}|${p.daylight}|${lw.M.STYLE._v}`;
+  if (lw.bgKey !== bgKey) { lw.M.drawBackdrop(bg.getContext("2d"), LW_W, LW_H, lw.geo, p); lw.bgKey = bgKey;
+                            ctx.clearRect(0, 0, LW_W, LW_H); lw.geo._prevBox = null; }
+  if (debug || lw.wasDebug) { ctx.clearRect(0, 0, LW_W, LW_H); lw.geo._prevBox = null; lw.wasDebug = debug; }
   const t0 = performance.now();
-  if (p) lw.M.draw(ctx, LW_W, LW_H, lw.geo, p, lw.t);
-  else { ctx.fillStyle = "#05080d"; ctx.fillRect(0, 0, LW_W, LW_H); }
-  lw.drawMs = lw.drawMs == null ? 0 : lw.drawMs * 0.95 + (performance.now() - t0) * 0.05;
-
-  if ($("lwDebug").checked && lw.geo) for (const s of lw.geo.shores) {
+  lw.M.draw(ctx, LW_W, LW_H, lw.geo, p, lw.t, { backdrop: false });
+  const ms = performance.now() - t0;
+  lw.drawMs = lw.drawMs == null ? ms : lw.drawMs * 0.95 + ms * 0.05;
+  if (debug) for (const s of lw.geo.shores) {
     ctx.strokeStyle = "#ff3b8d"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(s.xs[0], s.ys[0]);
     for (let i = 1; i < s.n; i++) ctx.lineTo(s.xs[i], s.ys[i]); ctx.stroke();
     ctx.strokeStyle = "#ffd23f"; ctx.lineWidth = 1;
-    for (let i = 0; i < s.n; i += 12) { ctx.beginPath(); ctx.moveTo(s.xs[i], s.ys[i]); ctx.lineTo(s.xs[i] + s.nx[2][i] * 18, s.ys[i] + s.ny[2][i] * 18); ctx.stroke(); }
+    for (let i = 0; i < s.n; i += 6) { ctx.beginPath(); ctx.moveTo(s.xs[i], s.ys[i]); ctx.lineTo(s.xs[i] + s.nx[2][i] * 18, s.ys[i] + s.ny[2][i] * 18); ctx.stroke(); }
   }
-  // read-out (the app draws its own; this mirrors it)
-  ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(0, 0, LW_W, 64); ctx.fillRect(0, LW_H - 30, LW_W, 30);
-  txt(ctx, $("lwPreset").selectedOptions[0]?.textContent || "Pin", 24, 40, 26, "#e6edf3", 700);
+  lwHud(p);
+  lw.raf = requestAnimationFrame(lwFrame);
+}
+
+// Read-out as HTML, updated only when its text changes (no per-frame text rendering).
+function lwHud(p) {
   const comp = d => d == null ? "" : LW_COMPASS[Math.round(d / 22.5) % 16];
   let info = lw.status || "Loading…";
   if (p && !lw.status) {
@@ -1254,12 +1304,21 @@ function lwFrame(ts) {
     info = `${src} · surf ~${p.hb.toFixed(1)} m · ${Math.round(p.T)} s ${comp(p.dir)}`
       + (p.h2 > 0.2 ? ` + ${p.h2.toFixed(1)} m ${Math.round(p.T2)} s ${comp(p.dir2)}` : "")
       + ` · wind ${Math.round(p.windMph)} mph ${p.wind || ""} · tide ${p.tideM >= 0 ? "+" : ""}${p.tideM.toFixed(2)} m`
-      + (p.blocked ? " · swell blocked here" : "");
+      + (p.blocked ? " · swell blocked here" : "")
+      + (p.breaking === "secondary" ? ` · ${comp(p.dir2)} swell breaking here` : "");
   }
-  txt(ctx, info, LW_W - 24, 40, 17, lw.status ? "#d29922" : "#c9d1d9", 500, "right");
-  txt(ctx, `${lw.M ? lw.M.ATTRIBUTION : ""} · ${lw.M ? lw.M.CAPTION : ""}`, LW_W - 16, LW_H - 10, 12, "#8b949e", 400, "right");
-  if ($("lwDebug").checked) txt(ctx, `draw ${lw.drawMs.toFixed(2)} ms`, 16, LW_H - 10, 12, "#ffd23f", 600);
-  lw.raf = requestAnimationFrame(lwFrame);
+  const name = $("lwPreset").selectedOptions[0]?.textContent || "Pin";
+  const perf = $("lwDebug").checked && lw.drawMs != null ? `draw ${lw.drawMs.toFixed(2)} ms` : "";
+  const foot = lw.M ? `${lw.M.ATTRIBUTION} · ${lw.M.CAPTION}` : "";
+  const key = name + info + perf + foot;
+  if (key === lw.hudKey) return;
+  lw.hudKey = key;
+  $("lwName").textContent = name; $("lwInfo").textContent = info; $("lwPerf").textContent = perf; $("lwFoot").textContent = foot;
+  $("lwInfo").style.color = lw.status ? "#d29922" : "";
+}
+
+function lwShareHash() {
+  history.replaceState(null, "", `#live=${(+lwVal("lwLat")).toFixed(4)},${(+lwVal("lwLon")).toFixed(4)},${lwVal("lwBreak")}`);
 }
 
 async function toggleLive(force) {
@@ -1269,21 +1328,37 @@ async function toggleLive(force) {
   $("lwCard").classList.toggle("hidden", !lw.on);
   updateViews();
   cancelAnimationFrame(lw.raf);
-  if (!lw.on) { if (isSq()) drawPage(); return; }
+  if (!lw.on) { drawPage(); return; }
+  clearTimeout(sq.mapTimer);
   lw.last = 0; lw.raf = requestAnimationFrame(lwFrame);
   await Promise.all([lwBuild(), lw.hour ? null : lwForecast()]);
 }
 function lwInit() {
-  $("lwPreset").innerHTML = LW_PRESETS.map(([n], i) => `<option value="${i}">${n}</option>`).join("") + `<option value="custom">Custom pin</option>`;
+  const regions = [...new Set(LW_PRESETS.map(p => p[4]))];
+  $("lwPreset").innerHTML = regions.map(r => `<optgroup label="${r}">` +
+      LW_PRESETS.map((p, i) => p[4] === r ? `<option value="${i}">${p[0]}</option>` : "").join("") + `</optgroup>`).join("")
+    + `<option value="custom">Custom pin</option>`;
   const reload = () => { if (!lw.on) return; lwBuild(); lwForecast(); };
   $("lwPreset").onchange = () => { const p = LW_PRESETS[+lwVal("lwPreset")]; if (!p) return;
-    $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3]; reload(); };
-  for (const id of ["lwLat", "lwLon"]) $(id).onchange = () => { $("lwPreset").value = "custom"; reload(); };
+    $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3]; lwShareHash(); reload(); };
+  const step = d => { const cur = +lwVal("lwPreset"), n = LW_PRESETS.length;
+    $("lwPreset").value = String(((Number.isNaN(cur) ? -1 : cur) + d + n) % n); $("lwPreset").onchange(); };
+  $("lwPrevBreak").onclick = () => step(-1); $("lwNextBreak").onclick = () => step(1);
+  document.addEventListener("keydown", e => { if (!lw.on || ["INPUT", "SELECT"].includes(e.target.tagName)) return;
+    if (e.key === "]") step(1); if (e.key === "[") step(-1); });
+  for (const id of ["lwLat", "lwLon"]) $(id).onchange = () => { $("lwPreset").value = "custom"; lwShareHash(); reload(); };
+  $("lwBreak").onchange = () => { lw.params = null; lwShareHash(); };
   $("lwZoom").onchange = () => lw.on && lwBuild();
   $("lwApi").onchange = () => lw.on && lwForecast();
   $("lwReload").onclick = () => { lw.key = null; reload(); };
   $("lwApi").value = location.hostname === "localhost" ? "http://localhost:8000" : "https://swellapi-1.onrender.com";
-  const p = LW_PRESETS[0]; $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3];
+  // #live=lat,lon,type opens straight into the live view at that pin (shareable)
+  const m = location.hash.match(/live=(-?[\d.]+),(-?[\d.]+)(?:,(\w+))?/);
+  const start = LW_PRESETS.findIndex(p => p[0].startsWith("Southlands"));
+  if (m) { $("lwLat").value = m[1]; $("lwLon").value = m[2]; $("lwBreak").value = m[3] || "beach";
+           $("lwPreset").value = String(LW_PRESETS.findIndex(p => p[1] === +m[1] && p[2] === +m[2])); if ($("lwPreset").value === "-1" || !$("lwPreset").value) $("lwPreset").value = "custom";
+           setTimeout(() => toggleLive(true), 300); }
+  else { const p = LW_PRESETS[start]; $("lwPreset").value = String(start); $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3]; }
   $("bLive").onclick = () => toggleLive();
   document.addEventListener("keydown", e => { if (e.key === "l" && !["INPUT", "SELECT"].includes(e.target.tagName)) toggleLive(); });
 }

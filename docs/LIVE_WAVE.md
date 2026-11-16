@@ -11,16 +11,24 @@ import { buildGeo, paramsFromHour, draw, ATTRIBUTION, CAPTION } from "./livewave
 
 const geo    = await buildGeo({ lat, lon, width: 992, height: 430 });   // per spot + box size; never throws
 const params = paramsFromHour(hour, spot, geo, dayHours);               // when the hour changes
-draw(ctx, w, h, geo, params, tSeconds);                                 // every frame
+drawBackdrop(bgCtx, w, h, geo, params);                                 // backdrop canvas: only on change
+draw(waveCtx, w, h, geo, params, tSeconds, { backdrop: false });        // wave canvas: every frame
 ```
+
+**Use two stacked canvases.** The backdrop (photo, grading, dark sea) goes on the bottom
+canvas and is redrawn only when the spot, box size, grading or day/night changes. The wave
+canvas on top is transparent; `draw` with `backdrop: false` clears and repaints only the
+small box around the break. (Single canvas also works: `draw(ctx, ...)` without the option
+paints both, but costs a full-canvas pass per frame.)
 
 - `hour` is one item of `days[].hours[]` from `POST /forecast`. `spot` needs only
   `break_type`. `dayHours` (that day's hours) is optional; it lets the tide use the real range.
 - `draw` cover-fits the scene into `w × h`. Your existing loop owns DPR, resizing,
   visibility and reduced motion; pass a monotonic `t` in seconds.
-- No per-frame allocations: shoreline data is `Float32Array`s, there are module-level
-  scratch buffers, the spray pool is fixed, and direction-dependent work is precomputed
-  in `paramsFromHour`.
+- No per-frame allocations in the steady state: shoreline data and stroke geometry live in
+  reusable typed arrays, and the spray pool is fixed.
+- Tuning: geometry options in `DEFAULTS` (passed to `buildGeo`), look and behaviour in the
+  exported `STYLE` object (bump `STYLE._v` after changing it so params recompute).
 - **What it assumes you have:**
   - Dynamic `import()` from jsDelivr for `@mapbox/vector-tile@2.0.3` and `pbf@4.0.1`
     (about 10 KB together). If Base44 lets you add npm packages, install those versions
@@ -138,18 +146,34 @@ Layers, in order:
 `a` is wave size (0.15–1) × set factor × distance fade. **The dark shoreward stroke
 under every white line is what makes crests read**, including over foam and bright water.
 
+## Only the break, not the whole coast
+
+`buildGeo` keeps just the coastline at the pin: the stretch nearest it, `breakHalfWidthM`
+(600 m) either side, smoothed over `smoothM` (60 m) so inlets, rocks and jetties don't make
+squiggles, with the ends tapering out. Offshore, crests straighten into lines square to the
+swell; near shore they bend to follow the coast. That reads as refraction and can't loop in bays.
+Coast facing away from a swell gets no lines from it (shelter). Each swell is judged by its own
+direction, and the one that actually reaches the break (size × exposure) is the breaking one:
+e.g. a big swell blocked by an island plus a small one that wraps in.
+
+Pin placement matters: the scene centres on the nearest coast to the pin, so put the pin on
+the water just off the break.
+
 ## 10. Performance
 
-- **Measured** (M-series desktop, 1240×540, both swells): about **1.35 ms** per frame at
-  Southlands (14 coastline runs), **0.5 ms** at Hossegor (one straight beach). The
-  backdrop is one cached bitmap, so it's essentially free.
-- **Phones:** roughly 3–5× slower, so expect 2–6 ms. To get under 2 ms on a mid-range
-  phone, cut in this order:
-  1. `buildGeo({..., opts: { sampleSpacing: 8, maxShorePoints: 400 } })`: fewer
-     shoreline samples, nearest the pin first.
-  2. `opts.secondary = false`.
-  3. Run at 30 fps on phones (waves move slowly; it's barely noticeable).
-  4. `opts.spray = 0`.
+- **Measured** (desktop, 1240×540, both swells, two-canvas setup, GPU work included by
+  reading back once after 120 frames): **0.24–1.34 ms per frame** across Nazaré, Mundaka,
+  Pipeline, Southlands, J-Bay, Hossegor and the generic beach. Strong onshore wind is the
+  top end, because whitecaps use the whole canvas.
+- What keeps it cheap: the break-only coastline (60–110 samples instead of ~900), crests binned
+  so each point touches only the ~6 crests it's on, about 40 batched strokes from reusable
+  typed arrays, a cached backdrop, and a dirty rectangle (typically ~300×400 px) for the
+  clear, the sea-mask composite and the layer composite.
+- **Phones:** roughly 3–5× slower, so expect about 1–4 ms. If over 2 ms, cut in this order:
+  1. `STYLE.whitecaps = false` (it's the only full-canvas effect).
+  2. `buildGeo({..., opts: { sampleSpacing: 8, breakHalfWidthM: 400 } })`: fewer samples.
+  3. `STYLE.secondary = false`.
+  4. Run at 30 fps on phones (waves move slowly; it's barely noticeable).
 - **Building at the box size** (500×340 on phones) also shrinks the work.
 
 ## 11. Caption
