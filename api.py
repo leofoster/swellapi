@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
 
 import surfdeck
 import coast
+import buoys
 from surfdeck import (
     SpotConfig,
     UpstreamError,
@@ -59,6 +60,8 @@ class SpotRequest(BaseModel):
     exposure:           float = 1.0
     shadow_zones:       list[list[float]] = []
     wrap_factor:        float = 0.0
+    height_scale:       float = Field(default=1.0, gt=0, le=3,
+                                      description="Per-spot surf height calibration: 0.8 if it reads 20% high")
 
     tide_level_ideal:    Optional[str] = Field(default=None, description="low | mid-low (alias low-mid) | mid | mid-high | high")
     tide_movement_ideal: Optional[str] = Field(default=None, pattern="^(rising|falling)$")
@@ -91,6 +94,8 @@ class HourlyReading(BaseModel):
     secondary_swell_direction_deg: Optional[float] = None
     secondary_swell_direction_compass: str = "---"
     surf_height_m:       Optional[float] = None   # v2: breaking-height estimate (Komar & Gaughan)
+    surf_min_m:          Optional[float] = None   # v2: surf range to display, e.g. "2-3 ft"
+    surf_max_m:          Optional[float] = None
     daylight:            Optional[bool] = None
 
     tide_height_m:       Optional[float]
@@ -165,6 +170,7 @@ def request_to_spot_config(req: SpotRequest) -> SpotConfig:
         wind_speed_max=req.wind_speed_max,
         break_type=req.break_type, exposure=req.exposure,
         shadow_zones=[tuple(z) for z in req.shadow_zones], wrap_factor=req.wrap_factor,
+        height_scale=req.height_scale,
         tide_level_ideal=req.tide_level_ideal, tide_movement_ideal=req.tide_movement_ideal,
     )
 
@@ -180,6 +186,7 @@ def spot_to_request(spot: SpotConfig, lat: float, lon: float, days: int, tz: str
         wind_speed_max=spot.wind_speed_max,
         break_type=spot.break_type, exposure=spot.exposure,
         shadow_zones=[list(z) for z in spot.shadow_zones], wrap_factor=spot.wrap_factor,
+        height_scale=spot.height_scale,
         tide_level_ideal=spot.tide_level_ideal, tide_movement_ideal=spot.tide_movement_ideal,
         days=days, timezone=tz,
     )
@@ -214,6 +221,8 @@ def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[di
         secondary_swell_direction_deg=hour.get("swell2_direction_deg"),
         secondary_swell_direction_compass=deg_to_compass(hour.get("swell2_direction_deg")),
         surf_height_m=inferred.get("surf_height_m"),
+        surf_min_m=inferred.get("surf_min_m"),
+        surf_max_m=inferred.get("surf_max_m"),
         daylight=hour.get("daylight"),
         tide_height_m=tide_hour["height_m"] if tide_hour else None,
         tide_status=tide_hour["status"] if tide_hour else None,
@@ -532,6 +541,29 @@ def spot_suggest(lat: float = Query(..., ge=-85, le=85), lon: float = Query(...,
         return coast.suggest(lat, lon, break_type)
     except coast.CoastError as e:
         raise HTTPException(status_code=503, detail=f"Map tiles unavailable: {e}")
+
+
+@app.get("/buoys/near")
+def buoys_near(lat: float = Query(..., ge=-90, le=90), lon: float = Query(..., ge=-180, le=180),
+               max_km: float = Query(300, gt=0, le=1000), k: int = Query(5, ge=1, le=10),
+               hours: float = Query(0, ge=0, le=72, description="0 = latest reading only")):
+    """Nearest NOAA NDBC buoys to any coordinate: exact position, distance, bearing and raw readings.
+    Empty `buoys` (not an error) where NDBC has no station in range."""
+    found = buoys.near(lat, lon, max_km=max_km, k=k, hours=hours)
+    return {"lat": lat, "lon": lon, "max_km": max_km, "source": "NOAA NDBC realtime2",
+            "count": len(found), "buoys": found, "units": buoys.UNITS,
+            "note": None if found else "No NDBC buoy in range (coverage is mostly US waters)."}
+
+
+@app.get("/buoys/{station_id}")
+def buoy_detail(station_id: str, hours: float = Query(24, ge=1, le=72)):
+    """One buoy: exact position and raw readings for the last `hours` (met + spectral swell split)."""
+    meta = buoys.station(station_id)
+    data = buoys.readings(station_id, hours=hours)
+    if not meta and not data["available"]:
+        raise HTTPException(status_code=404, detail=f"No NDBC station {station_id!r}")
+    return {"id": station_id, **(meta or {}), "source": "NOAA NDBC realtime2",
+            "url": f"https://www.ndbc.noaa.gov/station_page.php?station={station_id}", **data, "units": buoys.UNITS}
 
 
 @app.get("/health")
