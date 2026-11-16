@@ -19,11 +19,14 @@ import surfdeck
 from surfdeck import (
     SpotConfig,
     UpstreamError,
+    NoCoverageError,
     infer_spot,
     build_confidence,
     fetch_forecast,
     quality_key,
     get_tides,
+    buoy_correction,
+    DEFAULT_ENGINE,
     deg_to_compass,
     safe_mean,
     ISLANDS,
@@ -60,6 +63,8 @@ class SpotRequest(BaseModel):
     tide_movement_ideal: Optional[str] = Field(default=None, pattern="^(rising|falling)$")
 
     days:               int   = Field(default=3, ge=1, le=7)
+    engine:             Optional[str] = Field(default=None, pattern="^(v1|v2)$",
+                                          description="Scoring engine. Default v2; v1 = the original, for comparison")
     timezone:           str   = Field(default="UTC", description='IANA zone (e.g. "Atlantic/Bermuda") or "auto" to use the spot\'s own zone')
 
 
@@ -77,8 +82,16 @@ class HourlyReading(BaseModel):
     wind_direction_compass: str
     wind_gusts_mph:      Optional[float]
 
+    secondary_swell_height_m:      Optional[float] = None
+    secondary_swell_period_s:      Optional[float] = None
+    secondary_swell_direction_deg: Optional[float] = None
+    secondary_swell_direction_compass: str = "---"
+    surf_height_m:       Optional[float] = None   # v2: breaking-height estimate (Komar & Gaughan)
+    daylight:            Optional[bool] = None
+
     tide_height_m:       Optional[float]
     tide_status:         Optional[str]
+    tide_level:          Optional[float] = None   # 0 = local low, 1 = local high
     score_tide_mod:      Optional[float]
 
     score_direction:     float
@@ -105,7 +118,7 @@ class DaySummary(BaseModel):
     quality_key:    str              # from avg_score
     avg_score:      float
     avg_height_m:   float
-    peak_hour:      str
+    peak_hour:      str              # best daylight hour when daylight is known
     peak_quality:   str
     peak_quality_key: str
     peak_score:     float
@@ -118,7 +131,11 @@ class ForecastResponse(BaseModel):
     lon:         float
     timezone:    str              # the zone actually used (resolved when the request said "auto")
     generated:   str
-    tides_are_mock: bool           # true only when MOCK_TIDES=1; tide fields are null/empty otherwise
+    tides_are_mock: bool           # true only when MOCK_TIDES=1
+    tide_source:    Optional[str] = None   # "open-meteo-model", "mock", or null when no tide data
+    engine:         str = "v2"
+    buoy:           Optional[dict] = None  # v2: nearest NDBC buoy used to correct the next 12h
+    model_grid_km:  Optional[float] = None # distance from the spot to the ocean model's grid cell
     days:        list[DaySummary]
 
 
@@ -165,13 +182,14 @@ def spot_to_request(spot: SpotConfig, lat: float, lon: float, days: int, tz: str
 
 
 def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[dict],
-                         now: datetime, tz: ZoneInfo, tide_data: Optional[dict] = None) -> HourlyReading:
+                         now: datetime, tz: ZoneInfo, tide_data: Optional[dict] = None,
+                         engine: Optional[str] = None) -> HourlyReading:
     dt_utc = datetime.fromisoformat(hour["time"]).astimezone(timezone.utc)
     local  = dt_utc.astimezone(tz)
     hours_from_now = max(0, int((dt_utc - now).total_seconds() // 3600))
 
     tide_hour  = tide_data["hourly"].get(dt_utc.strftime("%Y-%m-%dT%H")) if tide_data else None
-    inferred   = infer_spot(hour, spot, tide_hour)
+    inferred   = infer_spot(hour, spot, tide_hour, engine)
     confidence = build_confidence(hour, buoy_summary, hours_from_now)
 
     return HourlyReading(
@@ -184,8 +202,15 @@ def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[di
         wind_direction_deg=hour.get("wind_direction_deg"),
         wind_direction_compass=deg_to_compass(hour.get("wind_direction_deg")),
         wind_gusts_mph=hour.get("wind_gusts_mph"),
+        secondary_swell_height_m=hour.get("swell2_height_m"),
+        secondary_swell_period_s=hour.get("swell2_period_s"),
+        secondary_swell_direction_deg=hour.get("swell2_direction_deg"),
+        secondary_swell_direction_compass=deg_to_compass(hour.get("swell2_direction_deg")),
+        surf_height_m=inferred.get("surf_height_m"),
+        daylight=hour.get("daylight"),
         tide_height_m=tide_hour["height_m"] if tide_hour else None,
         tide_status=tide_hour["status"] if tide_hour else None,
+        tide_level=tide_hour.get("level") if tide_hour else None,
         score_tide_mod=inferred.get("score_tide_mod", 0.0),
         score_direction=inferred["score_direction"],
         score_period=inferred["score_period"],
@@ -228,7 +253,8 @@ def group_into_days(readings: list[HourlyReading], days: int, now: datetime, tz:
             ))
             continue
 
-        best = max(day_hours, key=lambda h: h.score_overall)
+        lit  = [h for h in day_hours if h.daylight] or day_hours       # best window: daylight only
+        best = max(lit, key=lambda h: h.score_overall)
         avg  = safe_mean([h.score_overall for h in day_hours]) or 0
         summaries.append(DaySummary(
             date=date_str, day_label=label, high_tides=highs, low_tides=lows,
@@ -251,15 +277,26 @@ def compute_forecast(req: SpotRequest, now: Optional[datetime] = None) -> Foreca
 
     try:
         forecast, spot_tz = fetch_forecast(req.lat, req.lon)
+    except NoCoverageError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except UpstreamError as e:
         raise HTTPException(status_code=502, detail=f"Open-Meteo: {e}")
 
     tz_name = spot_tz if req.timezone.lower() == "auto" else req.timezone
     tz = _zone(tz_name)
+    engine = req.engine or DEFAULT_ENGINE
+
+    # v2: nudge the next 12h toward the nearest buoy. Optional; never fails a forecast.
+    buoy_info = None
+    if engine == "v2":
+        try:
+            forecast, buoy_info = buoy_correction(forecast, req.lat, req.lon, now)
+        except Exception:
+            buoy_info = None
 
     # Tides are optional: any failure means "no tide data", never a failed forecast.
     try:
-        tide_data = get_tides(req.lat, req.lon, req.days + 1, now)
+        tide_data = get_tides(req.lat, req.lon, req.days + 1, now, forecast, tz)
     except Exception:
         tide_data = None
 
@@ -268,11 +305,16 @@ def compute_forecast(req: SpotRequest, now: Optional[datetime] = None) -> Foreca
     end   = start + timedelta(days=req.days)
     hours = [h for h in forecast if start <= datetime.fromisoformat(h["time"]) < end]
 
-    readings = [build_hourly_reading(h, spot, None, now, tz, tide_data) for h in hours]
+    buoy_summary = buoy_info.get("summary") if buoy_info else None
+    readings = [build_hourly_reading(h, spot, buoy_summary, now, tz, tide_data, engine) for h in hours]
     return ForecastResponse(
         spot_name=req.spot_name, lat=req.lat, lon=req.lon, timezone=tz_name,
         generated=now.isoformat(timespec="seconds"),
-        tides_are_mock=tide_data is not None,
+        tides_are_mock=bool(tide_data) and tide_data.get("source", "mock") == "mock",
+        tide_source=(tide_data.get("source", "mock") if tide_data else None),
+        engine=engine,
+        model_grid_km=forecast[0].get("grid_km") if forecast else None,
+        buoy={k: v for k, v in buoy_info.items() if k != "summary"} if buoy_info else None,
         days=group_into_days(readings, req.days, now, tz, tide_data),
     )
 
@@ -329,6 +371,8 @@ class EspBlock(BaseModel):
     wg: Optional[float]  # wind direction deg
     r:  float            # rating 0-1
     q:  str              # rating label
+    dl: Optional[bool] = None   # any of the block's hours in daylight
+    sh: Optional[float] = None  # surf height estimate m (v2)
 
 
 class EspResponse(BaseModel):
@@ -371,6 +415,8 @@ def esp_from_forecast(full: ForecastResponse, blocks: int, now: datetime) -> Esp
             w=round(wind, 1) if wind is not None else None,
             wd=deg_to_compass(wdeg), wg=wdeg,
             r=score, q=_label_for(score),
+            dl=any(h.daylight for h in chunk) if any(h.daylight is not None for h in chunk) else None,
+            sh=round(safe_mean([h.surf_height_m for h in chunk]), 2) if any(h.surf_height_m is not None for h in chunk) else None,
         ))
     return EspResponse(s=full.spot_name, g=now.isoformat(timespec="seconds"),
                        gt=int(now.timestamp()), b=out)

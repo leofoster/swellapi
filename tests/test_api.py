@@ -23,6 +23,11 @@ def fake_forecast(lat, lon, start=None):
 
 
 @pytest.fixture(autouse=True)
+def no_buoys(monkeypatch):
+    monkeypatch.setattr(api, "buoy_correction", lambda rows, lat, lon, now: (rows, None))
+
+
+@pytest.fixture(autouse=True)
 def stub_upstream(monkeypatch):
     monkeypatch.setattr(api, "fetch_forecast", lambda lat, lon: (fake_forecast(lat, lon), "Atlantic/Bermuda"))
 

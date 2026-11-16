@@ -137,8 +137,12 @@ python scripts/relay.py off      # switch OFF, stop everything
 
 ## Not yet true
 
-- Tides: `fetch_mock_tides` is synthetic (highs are always 3.5m). The web app's
-  tide display was showing this mock data before it was switched off. It is off unless `MOCK_TIDES=1`, and
+- Tides: v2 uses Open-Meteo's modelled sea level (`TIDES=model`, default). Not yet
+  checked against real tide tables. `fetch_mock_tides` (synthetic) remains for
+  testing via `MOCK_TIDES=1`. It is off unless `MOCK_TIDES=1`, and
   never affects ratings by default.
-- Buoy data (NDBC) is fetched by nothing; confidence is model-only.
+- Buoy correction only covers NOAA NDBC moored buoys (mostly US waters and some
+  partners). Bermuda and Cornwall have none within 200 km, so they get no correction.
+- Engine v2 weights and thresholds are educated guesses; nothing is calibrated
+  against real session ratings yet.
 - Firmware v2 has not been compiled or run on hardware yet. The simulator has.
