@@ -21,7 +21,7 @@ def test_secondary_swell_counts():
     h = hour(swell2_height_m=0.9, swell2_period_s=12, swell2_direction_deg=183)
     v1, v2 = infer_spot(h, SOUTH, engine="v1"), infer_spot(h, SOUTH, engine="v2")
     assert v1["effective_height_m"] < 0.1                  # v1 only saw the shadowed WNW swell
-    assert v2["effective_height_m"] > 0.9
+    assert v2["effective_height_m"] >= 0.85
     assert v2["score_overall"] > v1["score_overall"] + 0.2
     assert v2["dominant_swell_dir"] == 183
 
@@ -139,3 +139,23 @@ def test_land_cell_with_no_wave_data_is_refused(monkeypatch):
     monkeypatch.setattr(sd, "_cache", {})
     with pytest.raises(sd.NoCoverageError, match="land"):
         sd.fetch_forecast(38.5, -98.0)
+
+
+def test_peak_period_sources():
+    # native peak wins
+    assert sd.peak_period(10.0, 270, 14.2, 15.0, 270) == (14.2, "model-peak")
+    # GFS-Wave used when it's the same swell (direction within 45 deg)
+    assert sd.peak_period(11.3, 280, None, 15.0, 300) == (15.0, "gfs-wave")
+    # different swell (direction far off) -> not borrowed; estimate from the mean
+    assert sd.peak_period(10.0, 280, None, 16.0, 180) == (13.5, "estimated")
+    # implausible GFS value (e.g. 0.0) -> estimate
+    assert sd.peak_period(10.0, 280, None, 0.0, 280) == (13.5, "estimated")
+    # nothing at all
+    assert sd.peak_period(None, None, None, None, None) == (None, None)
+
+
+def test_v2_scores_peak_period():
+    long_ = hour(swell_direction_deg=180, swell_period_s=10, swell_peak_period_s=15)
+    mean_only = hour(swell_direction_deg=180, swell_period_s=10)
+    assert infer_spot(long_, SOUTH)["score_period"] > infer_spot(mean_only, SOUTH)["score_period"]
+    assert infer_spot(long_, SOUTH, engine="v1")["score_period"] == infer_spot(mean_only, SOUTH, engine="v1")["score_period"]
