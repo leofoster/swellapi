@@ -620,7 +620,8 @@ def spot_history(request: Request,
         raise HTTPException(status_code=503, detail=f"Satellite imagery unavailable: {e}")
     base = _base_url(request)
     for p in out["passes"]:
-        p["image_path"] = f"/spot/history/image/{p['id']}?lat={lat}&lon={lon}&size_m={size_m:g}"
+        p["image_path"] = (f"/spot/history/image/{p['id']}?lat={lat}&lon={lon}&size_m={size_m:g}"
+                           f"&v={sat.IMAGE_VERSION}")
         p["image_url"] = base + p["image_path"]
     return out
 

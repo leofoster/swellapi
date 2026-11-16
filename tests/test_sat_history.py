@@ -11,7 +11,8 @@ HOST = h.COG_HOST + "x/"
 
 def item(i, when, tile=10):
     return {"id": f"S2A_28RDS_202611{i:02d}_0_L2A", "time": when, "satellite": "sentinel-2a",
-            "tile_cloud_pct": tile, "tci": HOST + f"{i}/TCI.tif", "scl": HOST + f"{i}/SCL.tif"}
+            "tile_cloud_pct": tile, "scl": HOST + f"{i}/SCL.tif",
+            **{b: HOST + f"{i}/{f}.tif" for b, f in (("red", "B04"), ("green", "B03"), ("blue", "B02"))}}
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +28,7 @@ def fake_scl(classes_by_item):
         n = int(href.split("/")[-2])
         if href.endswith("SCL.tif"):
             return np.full((1, 10, 10), classes_by_item[n], dtype="uint8")
-        return np.full((3, 10, 10), 120, dtype="uint8")
+        return np.full((1, 10, 10), 600, dtype="uint16")                   # raw band, reflectance 0.06
     return win
 
 
@@ -76,6 +77,7 @@ def test_endpoint_builds_https_image_urls(monkeypatch):
     assert r.status_code == 200
     url = r.json()["passes"][0]["image_url"]
     assert url.startswith("https://swellapi-1.onrender.com/spot/history/image/S2A_28RDS_20261115_0_L2A?")
+    assert f"v={h.IMAGE_VERSION}" in url                                     # cache-busts old looks
 
 
 def test_image_endpoint(monkeypatch):

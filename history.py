@@ -31,6 +31,11 @@ CHECK_BATCH = 8                  # passes cloud-checked in parallel per round
 COND_TTL = 6 * 3600
 GDAL_ENV = dict(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", AWS_NO_SIGN_REQUEST="YES",
                 CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif", GDAL_HTTP_MAX_RETRY=2, GDAL_CACHEMAX=64)
+# Raw L2A bands on Earth Search are already offset-corrected (water reads ~0.02-0.06), so
+# reflectance = DN x 1e-4 despite the -0.1 offset in the item metadata. Checked 2026-11-16.
+REFL_SCALE = 1e-4
+TONE_K, TONE_WHITE, TONE_SATURATION = 30.0, 0.75, 1.25
+IMAGE_VERSION = 2                # bump when the look changes: image URLs are cached as immutable
 ATTRIBUTION = "Contains modified Copernicus Sentinel data; conditions: Open-Meteo (model hindcast)"
 
 _session = requests.Session()
@@ -50,11 +55,11 @@ class HistoryError(Exception):
 
 def _summary(f: dict) -> Optional[dict]:
     a, p = f.get("assets", {}), f.get("properties", {})
-    tci, scl = (a.get("visual") or {}).get("href"), (a.get("scl") or {}).get("href")
-    if not (tci and scl and tci.startswith(COG_HOST) and scl.startswith(COG_HOST)):
+    hrefs = {k: (a.get(k) or {}).get("href") for k in ("scl", "red", "green", "blue")}
+    if not all(v and v.startswith(COG_HOST) for v in hrefs.values()):
         return None
     return {"id": f["id"], "time": p.get("datetime"), "satellite": p.get("platform"),
-            "tile_cloud_pct": p.get("eo:cloud_cover"), "tci": tci, "scl": scl}
+            "tile_cloud_pct": p.get("eo:cloud_cover"), **hrefs}
 
 
 def search(lat: float, lon: float, days: int, max_tile_cloud: float = 90) -> list[dict]:
@@ -64,7 +69,8 @@ def search(lat: float, lon: float, days: int, max_tile_cloud: float = 90) -> lis
             "datetime": f"{(end - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')}/{end.strftime('%Y-%m-%dT%H:%M:%SZ')}",
             "query": {"eo:cloud_cover": {"lte": max_tile_cloud}}, "limit": 200,
             "fields": {"include": ["id", "properties.datetime", "properties.platform", "properties.eo:cloud_cover",
-                                   "assets.visual.href", "assets.scl.href"], "exclude": ["links", "geometry"]}}
+                                   "assets.scl.href", "assets.red.href",
+                                   "assets.green.href", "assets.blue.href"], "exclude": ["links", "geometry"]}}
     try:
         r = _session.post(f"{STAC}/search", json=body, timeout=20)
         r.raise_for_status()
@@ -133,18 +139,27 @@ def spot_cloud(s: dict, lat: float, lon: float, size_m: float) -> tuple[float, f
 
 
 def image_jpeg(item_id: str, lat: float, lon: float, size_m: float = 2400, px: int = 720) -> bytes:
-    """True-colour crop centred on the point, brightened for screens, as JPEG."""
+    """True-colour crop centred on the point, as JPEG.
+
+    Built from the raw 16-bit red/green/blue bands, not the ready-made TCI (which clips at about
+    0.2 reflectance, blowing out whitewater, sand and buildings). An asinh curve lifts dark water
+    while keeping highlight detail; one fixed curve for every image so passes compare fairly."""
     key = (item_id, round(lat, 4), round(lon, 4), round(size_m), px)
     with _lock:
         if key in _img:
             _img.move_to_end(key)
             return _img[key]
     import numpy as np
-    from PIL import Image
-    a = _window(item(item_id)["tci"], lat, lon, size_m).astype("float32") / 255.0
-    a = np.clip((a * 1.7) ** 0.85, 0, 1)            # TCI is dark over water; same curve for every image
-    img = Image.fromarray((a.transpose(1, 2, 0) * 255).astype("uint8"))
+    from PIL import Image, ImageEnhance, ImageFilter
+    s = item(item_id)
+    with ThreadPoolExecutor(3) as ex:
+        bands = list(ex.map(lambda k: _window(s[k], lat, lon, size_m)[0], ("red", "green", "blue")))
+    refl = np.stack(bands).astype("float32") * REFL_SCALE
+    a = np.clip(np.arcsinh(TONE_K * refl) / np.arcsinh(TONE_K * TONE_WHITE), 0, 1)
+    img = Image.fromarray((a.transpose(1, 2, 0) * 255 + 0.5).astype("uint8"))
     img = img.resize((px, px), Image.LANCZOS)
+    img = ImageEnhance.Color(img).enhance(TONE_SATURATION)
+    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=70, threshold=2))
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=85, optimize=True)
     out = buf.getvalue()
