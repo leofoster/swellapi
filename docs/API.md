@@ -107,6 +107,34 @@ otherwise mean x 1.35. Checked against 8 NOAA buoys on 2026-11-16: mean absolute
 buoy peak period 3.3 s -> 1.9 s overall, about 3.9 s -> 1.2 s at groundswell buoys. Buoys
 dominated by local wind chop (dominant period under 9 s) don't compare like for like.
 
+## Surf height: angle loss, range and calibration
+
+- **Angle loss (beach, rivermouth):** a swell arriving at angle θ to the beach normal spreads
+  along the shore, so its height is scaled by `sqrt(cos θ)`. The beach normal is taken to be
+  `swell_dir_ideal`, so **set `swell_dir_ideal` to the direction the beach faces**. Points and
+  reefs are unchanged (they wrap and focus swell).
+- **Range:** `surf_min_m` and `surf_max_m` (0.7× and 1.0× of `surf_height_m`). Show
+  "2-3 ft" from these rather than a single number.
+- **`height_scale`** (request, default 1.0, max 3): per-spot calibration. If a spot reliably reads
+  20% high, send 0.8.
+- **Unverified:** the 0.7-1.0 range and the angle loss are calibrated against one beach
+  observation (La Cícer, 2026-11-16), not a dataset.
+
+## Buoys: positions and raw readings
+
+Source: NOAA NDBC realtime feeds. Coverage is mostly US waters plus some partner buoys;
+elsewhere the list is empty (not an error).
+
+- `GET /buoys/near?lat=&lon=&max_km=300&k=5&hours=0`: nearest buoys, each with `id`, `name`,
+  `owner`, exact `lat`/`lon`, `distance_km`, `bearing_deg` (from the spot), `observed_at`,
+  `latest` (newest non-null value of every field) and `available`. `hours>0` adds `met` and
+  `spectral` history.
+- `GET /buoys/{id}?hours=24`: one buoy with position, `latest`, `met` (wind, waves, pressure,
+  temperatures) and `spectral` (the buoy's own swell vs wind-wave split: `swell_height_m`,
+  `swell_period_s`, `swell_dir`, `wind_wave_*`, `steepness`). 404 for an unknown id.
+- `units` maps every field to its unit. Missing readings are `null`.
+- `POST /forecast` `buoy` (when a buoy corrected the forecast) now includes `name`, `lat`, `lon`.
+
 ## Device payload
 
 `POST /esp?blocks=8` takes the same body as `/forecast` and returns the compact
