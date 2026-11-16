@@ -191,6 +191,27 @@ elsewhere the list is empty (not an error).
 - `units` maps every field to its unit. Missing readings are `null`.
 - `POST /forecast` `buoy` (when a buoy corrected the forecast) now includes `name`, `lat`, `lon`.
 
+## Satellite history: GET /spot/history
+
+Past Sentinel-2 passes over a spot, each with a true-colour image and the conditions modelled for
+that hour, so you can see what a given swell, wind and tide actually did there.
+
+- `GET /spot/history?lat=&lon=&days=60&max_cloud=20&limit=12&size_m=2400` (pin the break itself;
+  `days` up to 92; `max_cloud` is % cloud over the crop, not the whole tile).
+- Returns `passes`, newest first: `id`, `time` (UTC), `satellite`, `spot_cloud_pct`,
+  `tile_cloud_pct`, `image_url`, `image_path`, and `conditions`: `wave_height_m`,
+  `swell_height_m`, `swell_period_s` (peak), `swell_direction_deg`/`swell_direction`,
+  `wind_speed_mph`, `wind_gusts_mph`, `wind_direction_deg`/`wind_direction`, `tide_height_m`,
+  `tide_level` (0 low to 1 high), `tide_status`. `conditions` is null if Open-Meteo is unavailable.
+- `GET /spot/history/image/{id}?lat=&lon=&size_m=2400&px=720`: JPEG crop (~100 kB), north up,
+  centred on the pin. Immutable: cache it forever.
+- Source: Copernicus Sentinel-2 L2A COGs on AWS (Earth Search). Free, no key, no rate limit we
+  depend on. 10 m pixels: whitewater lines and sandbars show, wave faces don't.
+- Passes are around 11:00-12:00 UTC (Canaries), every 2-5 days; trade-wind cloud removes many.
+  La Cícer, 60 days to 2026-11-16: 16 passes, 3 under 20% cloud at the spot.
+- Speed: first list ~10 s (cloud check per pass), then cached; each new image ~4-5 s.
+- Attribution required: "Contains modified Copernicus Sentinel data".
+
 ## Device payload
 
 `POST /esp?blocks=8` takes the same body as `/forecast` and returns the compact

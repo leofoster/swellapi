@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Optional
 import math
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,7 @@ import surfdeck
 import coast
 import calibrate as calib
 import buoys
+import history as sat
 from surfdeck import (
     SpotConfig,
     UpstreamError,
@@ -593,6 +594,49 @@ def buoy_detail(station_id: str, hours: float = Query(24, ge=1, le=72)):
         raise HTTPException(status_code=404, detail=f"No NDBC station {station_id!r}")
     return {"id": station_id, **(meta or {}), "source": "NOAA NDBC realtime2",
             "url": f"https://www.ndbc.noaa.gov/station_page.php?station={station_id}", **data, "units": buoys.UNITS}
+
+
+def _base_url(request: Request) -> str:
+    """Public base URL; Render terminates TLS, so trust its forwarded proto."""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+@app.get("/spot/history")
+def spot_history(request: Request,
+                 lat: float = Query(..., ge=-90, le=90), lon: float = Query(..., ge=-180, le=180),
+                 days: int = Query(60, ge=1, le=sat.MAX_DAYS),
+                 max_cloud: float = Query(20, ge=0, le=100, description="Max % cloud over the spot itself"),
+                 limit: int = Query(12, ge=1, le=30),
+                 size_m: float = Query(2400, ge=600, le=6000, description="Width of the square crop, metres"),
+                 include_cloudy: bool = Query(False)):
+    """Past Sentinel-2 satellite passes over a spot, each with a true-colour image and the swell,
+    wind and tide modelled for that hour. Pin the break itself (lat/lon), not offshore."""
+    try:
+        out = sat.history(lat, lon, days=days, max_cloud=max_cloud, limit=limit, size_m=size_m,
+                          include_cloudy=include_cloudy)
+    except sat.HistoryError as e:
+        raise HTTPException(status_code=503, detail=f"Satellite imagery unavailable: {e}")
+    base = _base_url(request)
+    for p in out["passes"]:
+        p["image_path"] = f"/spot/history/image/{p['id']}?lat={lat}&lon={lon}&size_m={size_m:g}"
+        p["image_url"] = base + p["image_path"]
+    return out
+
+
+@app.get("/spot/history/image/{item_id}")
+def spot_history_image(item_id: str, lat: float = Query(..., ge=-90, le=90), lon: float = Query(..., ge=-180, le=180),
+                       size_m: float = Query(2400, ge=600, le=6000), px: int = Query(720, ge=128, le=1024)):
+    """True-colour JPEG crop of one Sentinel-2 pass, centred on the spot. Immutable, so cache freely."""
+    try:
+        img = sat.image_jpeg(item_id, lat, lon, size_m=size_m, px=px)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except sat.HistoryError as e:
+        raise HTTPException(status_code=503, detail=f"Satellite imagery unavailable: {e}")
+    return Response(img, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.get("/health")
