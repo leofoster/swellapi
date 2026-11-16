@@ -42,9 +42,10 @@ PROXY_TOKEN        = os.environ.get("PROXY_TOKEN", "")
 OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
 # Open-Meteo refreshes hourly, so re-asking more often only burns the quota.
 OPEN_METEO_CACHE_TTL = float(os.environ.get("OPEN_METEO_CACHE_TTL", "1800"))
-# Tides are synthetic (see fetch_mock_tides). Off unless explicitly enabled so
-# fake data never moves real ratings.
+# Tides: "model" = Open-Meteo sea_level_height_msl (includes tides; a coarse ocean
+# model, not harbour tide tables), "mock" = synthetic sine (testing only), "off".
 MOCK_TIDES = os.environ.get("MOCK_TIDES", "") == "1"
+TIDES = "mock" if MOCK_TIDES else os.environ.get("TIDES", "model")
 
 DIRECT_URLS = {"marine": "https://marine-api.open-meteo.com/v1/marine",
                "weather": "https://api.open-meteo.com/v1/forecast"}
@@ -53,6 +54,19 @@ RELAY_PATHS = {"marine": "/marine", "weather": "/forecast"}
 
 class UpstreamError(RuntimeError):
     """Open-Meteo could not be reached or refused the request. Message is the reason."""
+
+
+class NoCoverageError(ValueError):
+    """The location is too far from any ocean model data to forecast surf (e.g. inland)."""
+
+
+MAX_GRID_KM = float(os.environ.get("MAX_GRID_KM", "100"))
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a))
 
 
 def safe_mean(values: list) -> Optional[float]:
@@ -236,16 +250,33 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
     with _cache_lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < OPEN_METEO_CACHE_TTL:
+            if hit[1] is None:
+                raise NoCoverageError(hit[2])
             return hit[1], hit[2]
 
     common = {"latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": FORECAST_DAYS}
-    marine = _get_json("marine", {**common, "hourly": [
+    # cell_selection=sea: a pin on the beach snaps to the nearest sea cell instead of a
+    # land cell with no wave data. The distance check below refuses inland points.
+    marine = _get_json("marine", {**common, "cell_selection": "sea", "hourly": [
         "wave_height", "wave_direction", "wave_period", "swell_wave_height",
         "swell_wave_direction", "swell_wave_period", "swell_wave_peak_period",
         "wind_wave_height", "wind_wave_period",
+        "secondary_swell_wave_height", "secondary_swell_wave_direction", "secondary_swell_wave_period",
+        "sea_level_height_msl",
     ]}, "marine")
     weather = _get_json("weather", {**common, "wind_speed_unit": "mph",
-        "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"]}, "weather")
+        "hourly": ["wind_speed_10m", "wind_direction_10m", "wind_gusts_10m"],
+        "daily": ["sunrise", "sunset"]}, "weather")
+
+    # Open-Meteo snaps to the nearest ocean grid cell, which for an inland point can be
+    # hundreds of km away. Refuse rather than forecast someone else's coast.
+    grid_km = haversine_km(lat, lon, marine.get("latitude", lat), marine.get("longitude", lon))
+    if grid_km > MAX_GRID_KM:
+        msg = (f"No ocean model data within {MAX_GRID_KM:.0f} km of ({lat}, {lon}); nearest is "
+               f"{grid_km:.0f} km away. Pick a point on or near the coast.")
+        with _cache_lock:
+            _cache[key] = (now, None, msg)
+        raise NoCoverageError(msg)
 
     tz_name = weather.get("timezone") or marine.get("timezone") or "UTC"
     try:
@@ -257,11 +288,27 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
         return datetime.fromisoformat(t).replace(tzinfo=tz).astimezone(timezone.utc).isoformat()
 
     mh, wh = marine["hourly"], weather["hourly"]
+    g = lambda arr, i: arr[i] if arr is not None and i is not None and i < len(arr) else None
+
+    # Daylight windows (UTC): first light ~30 min before sunrise, last light at sunset.
+    daily = weather.get("daily") or {}
+    light = []
+    for rise, set_ in zip(daily.get("sunrise") or [], daily.get("sunset") or []):
+        if rise and set_:
+            light.append((datetime.fromisoformat(rise).replace(tzinfo=tz) - timedelta(minutes=30),
+                          datetime.fromisoformat(set_).replace(tzinfo=tz)))
+
+    def is_daylight(t_local: datetime) -> Optional[bool]:
+        if not light:
+            return None
+        return any(a <= t_local < b for a, b in light)
+
     # Align on timestamp rather than index, in case the two models differ in length.
     w_idx = {t: i for i, t in enumerate(wh["time"])}
     rows = []
     for i, t in enumerate(mh["time"]):
         j = w_idx.get(t)
+        t_local = datetime.fromisoformat(t).replace(tzinfo=tz)
         rows.append({
             "time":                to_utc(t),
             "swell_height_m":      mh["swell_wave_height"][i],
@@ -274,7 +321,22 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
             "wind_speed_mph":      wh["wind_speed_10m"][j] if j is not None else None,
             "wind_direction_deg":  wh["wind_direction_10m"][j] if j is not None else None,
             "wind_gusts_mph":      wh["wind_gusts_10m"][j] if j is not None else None,
+            "swell2_height_m":     g(mh.get("secondary_swell_wave_height"), i),
+            "swell2_direction_deg": g(mh.get("secondary_swell_wave_direction"), i),
+            "swell2_period_s":     g(mh.get("secondary_swell_wave_period"), i),
+            "sea_level_m":         g(mh.get("sea_level_height_msl"), i),
+            # end of the hour counts, so a 06:00-07:00 slot with first light at 06:20 is daylight
+            "daylight":            is_daylight(t_local + timedelta(minutes=59)),
+            "grid_km":             round(grid_km, 1),
         })
+
+    # Inland (or a land cell) comes back with every wave value null.
+    if not any(r["swell_height_m"] is not None or r["wave_height_m"] is not None for r in rows):
+        msg = (f"No ocean wave data at ({lat}, {lon}): the model has this as land. "
+               f"Move the pin onto the water just off the break.")
+        with _cache_lock:
+            _cache[key] = (now, None, msg)
+        raise NoCoverageError(msg)
 
     with _cache_lock:
         _cache[key] = (now, rows, tz_name)
@@ -286,9 +348,120 @@ def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
     return fetch_forecast(lat, lon)[0]
 
 
-def get_tides(lat: float, lon: float, days: int, now: datetime) -> Optional[dict]:
-    """Tide data for scoring, or None. Only the mock exists today, behind MOCK_TIDES=1."""
-    return fetch_mock_tides(lat, lon, days, now) if MOCK_TIDES else None
+def get_tides(lat: float, lon: float, days: int, now: datetime,
+              rows: Optional[list] = None, tz=None) -> Optional[dict]:
+    """Tide data for scoring and display, or None. See TIDES."""
+    if TIDES == "mock":
+        return fetch_mock_tides(lat, lon, days, now)
+    if TIDES == "model" and rows:
+        return tides_from_sea_level(rows, tz or timezone.utc)
+    return None
+
+
+def tides_from_sea_level(rows: list, tz) -> Optional[dict]:
+    """Hourly height, rising/falling, 0-1 level within the local tidal range, and
+    daily highs/lows (parabolic peak fit) from Open-Meteo's modelled sea level."""
+    pts = [(datetime.fromisoformat(r["time"]), r.get("sea_level_m")) for r in rows]
+    pts = [(t, h) for t, h in pts if h is not None]
+    if len(pts) < 24:
+        return None
+    hs = [h for _, h in pts]
+    hourly, extremes = {}, {}
+    for i, (t, h) in enumerate(pts):
+        lo_i, hi_i = max(0, i - 13), min(len(pts), i + 14)          # about one tidal day around t
+        win = hs[lo_i:hi_i]
+        rng = max(win) - min(win)
+        level = (h - min(win)) / rng if rng >= 0.05 else 0.5
+        prev, nxt = hs[max(0, i - 1)], hs[min(len(hs) - 1, i + 1)]
+        hourly[t.strftime("%Y-%m-%dT%H")] = {"height_m": round(h, 2), "status": "rising" if nxt >= prev else "falling",
+                                             "level": round(level, 2)}
+        if 0 < i < len(hs) - 1:
+            a_, b_, c_ = hs[i - 1], h, hs[i + 1]
+            kind = "high" if b_ >= a_ and b_ > c_ else "low" if b_ <= a_ and b_ < c_ else None
+            if kind:
+                den = a_ - 2 * b_ + c_
+                off = 0.5 * (a_ - c_) / den if den else 0.0          # hours from t to the true peak
+                peak = b_ - 0.25 * (a_ - c_) * off
+                lt = (t + timedelta(hours=off)).astimezone(tz)
+                extremes.setdefault(str(lt.date()), {"high": [], "low": []})[kind].append(
+                    {"time": lt.strftime("%H:%M"), "height_m": round(peak, 2)})
+    return {"hourly": hourly, "extremes": extremes, "source": "open-meteo-model"}
+
+
+def nearest_buoys(lat: float, lon: float, max_km: float = 200.0, k: int = 3, timeout: float = 3.0) -> list[dict]:
+    """Up to k closest active NDBC moored buoys within max_km, nearest first. List cached 24h."""
+    now = time.monotonic()
+    if now - _stations["t"] > 86400:
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(_session.get("https://www.ndbc.noaa.gov/activestations.xml", timeout=timeout).content)
+            # moored buoys only: coastal "fixed" stations mostly measure tides/met, not waves
+            _stations["list"] = [(st.get("id"), float(st.get("lat")), float(st.get("lon")))
+                                 for st in root.iter("station") if st.get("type") == "buoy"]
+            _stations["t"] = now
+        except Exception:
+            _stations["t"] = now - 86400 + 600                         # retry in 10 min
+    near = []
+    for sid, la, lo in _stations["list"]:
+        d = 6371 * 2 * math.asin(math.sqrt(math.sin(math.radians(la - lat) / 2) ** 2 + math.cos(math.radians(lat))
+                                 * math.cos(math.radians(la)) * math.sin(math.radians(lo - lon) / 2) ** 2))
+        if d <= max_km:
+            near.append({"id": sid, "distance_km": round(d)})
+    return sorted(near, key=lambda b: b["distance_km"])[:k]
+
+
+_stations = {"t": -1e9, "list": []}
+_buoy_cache: dict = {}
+
+
+BUOY_BUDGET_S = 4.0   # total time the buoy lookup may add to a forecast
+
+
+def buoy_correction(rows: list, lat: float, lon: float, now: datetime, horizon_h: float = 12.0):
+    """Nudge the next `horizon_h` hours of swell toward what the nearest buoy measures now.
+    Works for any coordinate: no buoy in range, NOAA down, or a station without wave data all
+    mean "no correction" (rows returned unchanged, info None). Never raises; bounded time."""
+    try:
+        return _buoy_correction(rows, lat, lon, now, horizon_h)
+    except Exception as e:
+        print(f"  buoy correction skipped: {type(e).__name__}: {e}")
+        return rows, None
+
+
+def _buoy_correction(rows, lat, lon, now, horizon_h):
+    deadline = time.monotonic() + BUOY_BUDGET_S
+    st = obs = None
+    for cand in nearest_buoys(lat, lon, timeout=min(BUOY_BUDGET_S, 3.0)):
+        if time.monotonic() > deadline:
+            break
+        hit = _buoy_cache.get(cand["id"])
+        if not hit or time.monotonic() - hit[0] > (1800 if hit[1] else 86400):   # remember no-wave stations for a day
+            hit = (time.monotonic(), fetch_ndbc_buoy(cand["id"], timeout=max(0.5, deadline - time.monotonic())))
+            _buoy_cache[cand["id"]] = hit
+        if hit[1] and hit[1].get("wave_height_m"):
+            st, obs = cand, hit[1]
+            break
+    if not obs:
+        return rows, None
+    cur = min(rows, key=lambda r: abs((datetime.fromisoformat(r["time"]) - now).total_seconds()))
+    model = cur.get("wave_height_m")
+    if not model or model < 0.1:
+        return rows, None
+    ratio = max(0.6, min(1.6, obs["wave_height_m"] / model))
+    out = []
+    for r in rows:
+        ahead = (datetime.fromisoformat(r["time"]) - now).total_seconds() / 3600
+        k = 1 + (ratio - 1) * max(0.0, 1 - max(ahead, 0) / horizon_h) if ahead > -3 else 1.0
+        r = dict(r)
+        for key in ("swell_height_m", "swell2_height_m"):
+            if r.get(key) is not None:
+                r[key] = r[key] * k
+        out.append(r)
+    info = {"station": st["id"], "distance_km": st["distance_km"], "observed_wave_m": obs["wave_height_m"],
+            "model_wave_m": round(model, 2), "ratio": round(ratio, 2), "observed_at": obs.get("timestamp"),
+            "summary": summarise_buoys([obs])}
+    return out, info
+
 
 def fetch_mock_tides(lat: float, lon: float, days: int, now: datetime) -> dict:
     """
@@ -359,10 +532,10 @@ def fetch_mock_tides(lat: float, lon: float, days: int, now: datetime) -> dict:
     return {"hourly": tides_hourly, "extremes": extremes}
 
 
-def fetch_ndbc_buoy(buoy_id: str) -> Optional[dict]:
+def fetch_ndbc_buoy(buoy_id: str, timeout: float = 10) -> Optional[dict]:
     url = f"https://www.ndbc.noaa.gov/data/realtime2/{buoy_id}.txt"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         lines = resp.text.strip().splitlines()
         if len(lines) < 3: return None
@@ -386,7 +559,7 @@ def fetch_ndbc_buoy(buoy_id: str) -> Optional[dict]:
             "timestamp":     f"{values[0]}-{values[1]}-{values[2]} {values[3]}:{values[4]}",
         }
     except Exception as e:
-        print(f"  ⚠️  Buoy {buoy_id} unavailable: {e}")
+        print(f"  buoy {buoy_id} unavailable: {type(e).__name__}")
         return None
 
 def fetch_all_buoys(buoy_ids: list[str]) -> list[dict]:
@@ -478,11 +651,12 @@ def score_wind(wdir: float, wspd: float, spot: SpotConfig) -> float:
     penalty = min(1.0, wspd / 15)
     return round(max(0.0, 0.4 - penalty * 0.4), 3)
 
-def score_tide(tide_height: float, tide_status: str, spot: SpotConfig) -> float:
-    """Calculates a modifier between -0.15 and +0.15 based on tide preferences."""
+def score_tide(tide_height: float, tide_status: str, spot: SpotConfig, level: Optional[float] = None) -> float:
+    """Calculates a modifier between -0.15 and +0.15 based on tide preferences.
+    `level` (0 = local low, 1 = local high) is used when known; otherwise the
+    height is normalised against an assumed 0.5-3.5m range (mock tides)."""
     modifier = 0.0
-    # Assuming standard 0.5 to 3.5m range for normalization 
-    norm = min(max((tide_height - 0.5) / 3.0, 0.0), 1.0) 
+    norm = level if level is not None else min(max((tide_height - 0.5) / 3.0, 0.0), 1.0)
     
     level_map = {"low": 0.0, "low-mid": 0.25, "mid-low": 0.25, "mid": 0.5,
                  "mid-high": 0.75, "high-mid": 0.75, "high": 1.0}
@@ -500,7 +674,8 @@ def score_tide(tide_height: float, tide_status: str, spot: SpotConfig) -> float:
             
     return round(modifier, 3)
 
-def infer_spot(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
+def infer_spot_v1(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
+    """Original engine: primary swell only, hard direction window, binary wind."""
     swell_dir = hour.get("swell_direction_deg") or 0
     swell_h   = (hour.get("swell_height_m") or 0) * spot.exposure
     swell_p   = hour.get("swell_period_s") or 0
@@ -557,6 +732,160 @@ def infer_spot(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
         "score_overall":      overall,
         "quality":            quality,
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ENGINE v2
+# ─────────────────────────────────────────────────────────────────
+# Changes from v1 (each is a guess until checked against real session ratings):
+#  - every swell train counts (primary + secondary), combined by energy
+#  - height is period-aware: longer period surfs bigger (scaled to a 10s reference,
+#    so existing height preferences keep their meaning)
+#  - direction falls off smoothly outside the window instead of a cliff
+#  - light wind (glassy) is good from any direction; gusty wind is penalised
+#  - surf_height_m: breaking-height estimate (Komar & Gaughan 1972) for display
+#  - tide preference scored against the local tidal range when known
+G = 9.81
+GLASSY_MPH = 5.0        # at or below this, wind direction barely matters
+GLASSY_BLEND_MPH = 5.0  # blend from glassy to normal scoring over the next 5 mph
+GUSTY_DELTA_MPH = 10.0  # gusts this far above the mean wind cost 0.1
+REF_PERIOD_S = 10.0
+DIR_FALLOFF = 2.0       # direction factor reaches 0 at 90/DIR_FALLOFF = 45 deg outside the window
+ENGINE_WEIGHTS = {
+    "beach": {"dir": 0.30, "period": 0.25, "height": 0.25, "wind": 0.20},
+    "reef":  {"dir": 0.25, "period": 0.35, "height": 0.20, "wind": 0.20},
+    "point": {"dir": 0.35, "period": 0.30, "height": 0.20, "wind": 0.15},
+    "rivermouth": {"dir": 0.30, "period": 0.30, "height": 0.20, "wind": 0.20},
+}
+LABELS = [(0.85, "PUMPING"), (0.70, "GOOD"), (0.50, "FAIR"), (0.30, "POOR"), (0.00, "FLAT/BLOWN")]
+
+
+def ang_diff(a: float, b: float) -> float:
+    d = abs(a - b) % 360
+    return 360 - d if d > 180 else d
+
+
+def outside_window(d: float, dmin: float, dmax: float) -> float:
+    """0 inside the window, else degrees to the nearest edge."""
+    if direction_in_window(d, dmin, dmax):
+        return 0.0
+    return min(ang_diff(d, dmin), ang_diff(d, dmax))
+
+
+def breaking_height(h0: float, period: float) -> float:
+    """Komar & Gaughan (1972): Hb = 0.39 g^0.2 (T H0^2)^0.4, deep-water H0 in m, T in s."""
+    if h0 <= 0 or period <= 0:
+        return 0.0
+    return 0.39 * G ** 0.2 * (period * h0 ** 2) ** 0.4
+
+
+def swell_component(h: float, p: float, d: float, spot: SpotConfig) -> dict:
+    """How much of one swell train reaches the spot, and how good its angle is."""
+    in_shadow = any(direction_in_window(d, a, b) for a, b in spot.shadow_zones)
+    near = direction_in_window(d, spot.swell_dir_min - 25, spot.swell_dir_max + 25)
+    is_wrap = in_shadow and near and spot.wrap_factor > 0 and p >= 14
+    if in_shadow and not is_wrap:
+        factor, s_dir = 0.05, 0.0
+    elif is_wrap:
+        factor, s_dir = spot.wrap_factor * 0.6, spot.wrap_factor * 0.7
+    else:
+        out = outside_window(d, spot.swell_dir_min, spot.swell_dir_max)
+        if out == 0:
+            # scale each side of the window separately, so both edges score 0.3 and
+            # meet the outside fall-off without a step (windows are often asymmetric)
+            edge = spot.swell_dir_min if direction_in_window(d, spot.swell_dir_min, spot.swell_dir_ideal) else spot.swell_dir_max
+            half = max(ang_diff(spot.swell_dir_ideal, edge), 1)
+            factor, s_dir = 1.0, 0.3 + 0.7 * max(0.0, 1 - ang_diff(d, spot.swell_dir_ideal) / half)
+        else:
+            factor = math.cos(math.radians(min(90.0, out * DIR_FALLOFF))) ** 2
+            s_dir = 0.3 * factor
+    h_arr = h * spot.exposure * factor                       # what arrives, deep-water terms
+    h_eq = h_arr * (max(p, 1.0) / REF_PERIOD_S) ** 0.4        # period-aware equivalent height
+    return {"h_eq": h_eq, "hb": breaking_height(h_arr, p), "s_dir": s_dir,
+            "s_period": score_period(p, spot.swell_period_min, spot.swell_period_ideal),
+            "in_shadow": in_shadow and not is_wrap, "is_wrap": is_wrap, "dir": d, "period": p}
+
+
+def score_wind_v2(wdir: Optional[float], wspd: Optional[float], gust: Optional[float], spot: SpotConfig) -> float:
+    if wspd is None or wdir is None:
+        return 0.5
+    if wspd > spot.wind_speed_max:
+        s = 0.1
+    else:
+        k = wspd / max(spot.wind_speed_max, 1)
+        out = outside_window(wdir, spot.wind_offshore_min, spot.wind_offshore_max)
+        if out == 0:
+            normal = max(0.55, 1.0 - 0.45 * k)                # offshore
+        elif out <= 45:
+            normal = 0.65 - 0.4 * k                           # cross-shore
+        else:
+            normal = max(0.0, 0.45 - wspd / 25)               # onshore
+        if wspd <= GLASSY_MPH:
+            s = 0.95
+        elif wspd <= GLASSY_MPH + GLASSY_BLEND_MPH:
+            t = (wspd - GLASSY_MPH) / GLASSY_BLEND_MPH
+            s = 0.95 + (normal - 0.95) * t
+        else:
+            s = normal
+    if gust is not None and wspd > GLASSY_MPH and gust - wspd >= GUSTY_DELTA_MPH:
+        s -= 0.1
+    return round(max(0.0, min(1.0, s)), 3)
+
+
+def infer_spot_v2(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
+    trains = []
+    for hk, pk, dk in (("swell_height_m", "swell_period_s", "swell_direction_deg"),
+                       ("swell2_height_m", "swell2_period_s", "swell2_direction_deg")):
+        h, p, d = hour.get(hk), hour.get(pk), hour.get(dk)
+        if h and h > 0.05 and p and d is not None:
+            trains.append(swell_component(h, p, d, spot))
+    if not trains:
+        trains = [swell_component(0.0, hour.get("swell_period_s") or 1, hour.get("swell_direction_deg") or 0, spot)]
+
+    energy = [t["h_eq"] ** 2 for t in trains]
+    total = sum(energy)
+    wts = [e / total for e in energy] if total > 0 else [1 / len(trains)] * len(trains)
+    dom = trains[max(range(len(trains)), key=lambda i: energy[i])]
+    h_eq = math.sqrt(total)
+
+    s_dir    = sum(w * t["s_dir"] for w, t in zip(wts, trains))
+    s_period = sum(w * t["s_period"] for w, t in zip(wts, trains))
+    s_height = score_height(h_eq, spot.swell_height_min, spot.swell_height_ideal, spot.swell_height_max)
+    s_wind   = score_wind_v2(hour.get("wind_direction_deg"), hour.get("wind_speed_mph"), hour.get("wind_gusts_mph"), spot)
+
+    w = ENGINE_WEIGHTS.get(spot.break_type, ENGINE_WEIGHTS["beach"])
+    overall = s_dir * w["dir"] + s_period * w["period"] + s_height * w["height"] + s_wind * w["wind"]
+
+    s_tide = 0.0
+    if tide_hour and (spot.tide_level_ideal or spot.tide_movement_ideal):
+        s_tide = score_tide(tide_hour["height_m"], tide_hour["status"], spot, tide_hour.get("level"))
+        overall += s_tide
+    overall = round(max(0.0, min(1.0, overall)), 3)
+
+    return {
+        "spot": spot.name, "shore": spot.shore,
+        "effective_height_m": round(h_eq, 2),
+        "surf_height_m":      round(math.sqrt(sum(t["hb"] ** 2 for t in trains)), 2),
+        "is_wrap_event":      dom["is_wrap"],
+        "in_shadow":          dom["in_shadow"],
+        "dominant_swell_dir": dom["dir"],
+        "dominant_swell_period": dom["period"],
+        "score_direction":    round(s_dir, 3),
+        "score_period":       round(s_period, 3),
+        "score_height":       round(s_height, 3),
+        "score_wind":         round(s_wind, 3),
+        "score_tide_mod":     round(s_tide, 3),
+        "score_overall":      overall,
+        "quality":            next(lbl for t, lbl in LABELS if overall >= t),
+    }
+
+
+ENGINES = {"v1": infer_spot_v1, "v2": infer_spot_v2}
+DEFAULT_ENGINE = os.environ.get("ENGINE", "v2")
+
+
+def infer_spot(hour: dict, spot: SpotConfig, tide_hour: dict = None, engine: Optional[str] = None) -> dict:
+    return ENGINES[engine or DEFAULT_ENGINE](hour, spot, tide_hour)
 
 
 # Lowercase quality scale for app clients. Same 0.30/0.50/0.70/0.85 cut points as

@@ -324,6 +324,7 @@ async function pollForecast() {
   const fresh = (doc.b || []).slice(0, MAX_BLOCKS).map(b => ({
     timeLabel: b.t ?? "--", quality: b.q ?? "--", swellDir: b.sd ?? "--", windDir: b.wd ?? "--",
     start: b.e ?? 0, hoursFromNow: b.hn ?? 0, swellDeg: b.sg ?? null, windDeg: b.wg ?? null,
+    daylight: b.dl ?? null, surfHeight: b.sh ?? null,
     swellHeight: b.h ?? 0, swellPeriod: b.p ?? 0, windSpeed: b.w ?? 0, rating: b.r ?? 0,
   }));
   if (!fresh.length) { dev.lastError = "empty forecast"; return false; }
@@ -486,6 +487,12 @@ function sqClock(now) {
   return new Date(now * 1000).toLocaleTimeString("en-GB", { timeZone: sqTz(), hour: "2-digit", minute: "2-digit" });
 }
 function sqVisible(now) { return dev.blocks.filter(b => blockVisible(b, now)); }
+// Best window = highest rating among daylight blocks (all blocks if daylight is unknown).
+function sqBest(blocks) {
+  const lit = blocks.filter(b => b.daylight !== false);
+  const pool = lit.length ? lit : blocks;
+  return pool.reduce((a, b) => (b.rating > a.rating ? b : a), pool[0]);
+}
 function sqStale(now) { return !!dev.lastError || (now && dev.generatedAt && now - dev.generatedAt > STALE_S); }
 
 function sqHeader(ctx, now, subtitle) {
@@ -521,7 +528,7 @@ function sqNow(ctx, now) {
   const x = 392;
   txt(ctx, "SWELL", x, 214, 18, C.muted, 600);
   txt(ctx, `${fmt(v.swellHeight, 1)} m`, x, 282, 68, C.text, 700);
-  txt(ctx, `${fmt(v.swellPeriod, 0)} s  ·  ${v.swellDir}`, x, 322, 28, C.muted, 500);
+  txt(ctx, `${fmt(v.swellPeriod, 0)} s  ·  ${v.swellDir}${v.surfHeight != null ? `  ·  surf ~${fmt(v.surfHeight, 1)} m` : ""}`, x, 322, v.surfHeight != null ? 22 : 28, C.muted, 500);
   arrow(ctx, 650, 262, v.swellDeg, 26, C.text);
   ctx.fillStyle = C.line; ctx.fillRect(x, 352, SQ - 40 - x, 2);
   txt(ctx, "WIND", x, 396, 18, C.muted, 600);
@@ -531,12 +538,12 @@ function sqNow(ctx, now) {
 
   // next 24h strip
   const next = vis.slice(0, 8), top = 590, base = 672, maxH = Math.max(1, ...next.map(b => b.swellHeight || 0));
-  const best = next.reduce((a, b) => (b.rating > a.rating ? b : a), next[0]);
+  const best = sqBest(next);
   txt(ctx, "NEXT 24 HOURS", 40, top - 12, 16, C.muted, 600);
   const bw = (SQ - 80) / 8;
   next.forEach((b, i) => {
     const bx = 40 + i * bw + 4, h = 12 + (b.swellHeight || 0) / maxH * 50;
-    ctx.fillStyle = qual(b.rating)[2]; ctx.globalAlpha = b === best ? 1 : 0.75;
+    ctx.fillStyle = qual(b.rating)[2]; ctx.globalAlpha = b === best ? 1 : b.daylight === false ? 0.3 : 0.75;
     ctx.beginPath(); ctx.roundRect(bx, base - h, bw - 8, h, 6); ctx.fill(); ctx.globalAlpha = 1;
     if (i === 0) { ctx.strokeStyle = C.text; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(bx - 3, base - h - 3, bw - 2, h + 6, 8); ctx.stroke(); }
     txt(ctx, b.timeLabel.split(" ")[1], bx + (bw - 8) / 2, base + 24, 18, i === 0 ? C.text : C.muted, 500, "center");
@@ -561,14 +568,15 @@ function sqOutlook(ctx, now) {
       if (i) { ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, top - 30); ctx.lineTo(x, base + 120); ctx.stroke(); }
       txt(ctx, day.toUpperCase(), x + 6, top - 12, 16, C.muted, 700); lastDay = day;
     }
-    ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(x + 3, base - h, bw - 6, h, 4); ctx.fill();
+    ctx.fillStyle = col; ctx.globalAlpha = b.daylight === false ? 0.3 : 1;     // night blocks dimmed
+    ctx.beginPath(); ctx.roundRect(x + 3, base - h, bw - 6, h, 4); ctx.fill(); ctx.globalAlpha = 1;
     arrow(ctx, x + bw / 2, base + 40, b.windDeg, 10, C.muted);
     txt(ctx, fmt(b.windSpeed, 0), x + bw / 2, base + 76, 15, C.muted, 500, "center");
     if (i % 2 === 0) txt(ctx, b.timeLabel.split(" ")[1], x + bw / 2, base + 104, 14, C.dim, 500, "center");
   });
   txt(ctx, "WIND mph", left, base + 132, 13, C.dim, 600);
   if (!vis.length) return;
-  const best = vis.reduce((a, b) => (b.rating > a.rating ? b : a), vis[0]), [, label, col] = qual(best.rating);
+  const best = sqBest(vis), [, label, col] = qual(best.rating);
   ctx.fillStyle = C.panel; ctx.beginPath(); ctx.roundRect(40, 622, SQ - 80, 64, 12); ctx.fill();
   if (best.rating < 0.4) { txt(ctx, "Nothing worth paddling out for in the next 48h", SQ / 2, 662, 22, C.muted, 500, "center"); return; }
   txt(ctx, "BEST", 62, 662, 18, C.muted, 700);
