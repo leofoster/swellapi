@@ -61,6 +61,9 @@
   .dots i { width: 6px; height: 6px; border-radius: 50%; background: #555; }
   .dots i.on { background: #e0e0e0; width: 9px; height: 9px; }
   .hidden { display: none !important; }
+  .sqframe { width: min(560px, 100%); aspect-ratio: 1; padding: 18px; border-radius: 22px; background: #1b1f24;
+             box-shadow: inset 0 0 0 1px #2d333b, 0 14px 40px rgba(0,0,0,.45); cursor: pointer; }
+  .sqframe canvas { display: block; width: 100%; height: 100%; border-radius: 6px; background: #0b0f14; }
   .tunegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 16px; }
   .trow { display: flex; gap: 8px; align-items: center; }
   .trow input[type=range] { flex: 1; min-width: 0; }
@@ -86,6 +89,7 @@
 <main>
   <section class="card device">
     <div class="pcb" id="oledView"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
+    <div class="sqframe hidden" id="sqView" title="Click to change page"><canvas id="sq" width="720" height="720"></canvas></div>
     <div class="screen hidden" id="mapView">
       <canvas id="mapCanvas"></canvas>
       <div class="hud"><span id="mapTitle">SWELL</span><small id="mapTime"></small></div>
@@ -120,8 +124,8 @@
     </div>
     <div class="row">
       <div><label for="sHeight">Panel</label>
-        <select id="sHeight"><option value="64">128×64</option><option value="32">128×32</option></select></div>
-      <div><label for="sColor">Colour</label>
+        <select id="sHeight"><option value="64">OLED 128×64</option><option value="32">OLED 128×32</option><option value="sq">Square 5" 720×720</option></select></div>
+      <div id="sColorWrap"><label for="sColor">Colour</label>
         <select id="sColor"><option value="duo">Yellow/blue</option><option value="white">White</option><option value="blue">Blue</option></select></div>
     </div>
     <div>
@@ -234,6 +238,7 @@ function layout(height) {
 const X_TAG = 92, X_TIME_C = 86, X_DET = 60, X_PCT = 104, X_WARN = 122, NAME_CHARS = 15;
 
 const $ = id => document.getElementById(id);
+const isSq = () => $("sHeight").value === "sq";
 const faults = new Set();
 let display, L;
 let dev;                       // device state, reset on reboot
@@ -263,6 +268,7 @@ function showStatus(l1, l2) {
   display.setCursor(0, 0); display.print(l1);
   if (l2) { display.setCursor(0, 12); display.print(l2); }
   paint();
+  if (isSq()) sqStatus(l1, l2);
 }
 
 function buildUrl() {
@@ -317,7 +323,7 @@ async function pollForecast() {
 
   const fresh = (doc.b || []).slice(0, MAX_BLOCKS).map(b => ({
     timeLabel: b.t ?? "--", quality: b.q ?? "--", swellDir: b.sd ?? "--", windDir: b.wd ?? "--",
-    start: b.e ?? 0, hoursFromNow: b.hn ?? 0,
+    start: b.e ?? 0, hoursFromNow: b.hn ?? 0, swellDeg: b.sg ?? null, windDeg: b.wg ?? null,
     swellHeight: b.h ?? 0, swellPeriod: b.p ?? 0, windSpeed: b.w ?? 0, rating: b.r ?? 0,
   }));
   if (!fresh.length) { dev.lastError = "empty forecast"; return false; }
@@ -376,6 +382,13 @@ function drawBlock(v, now, warn) {
 
 function drawPage() {
   const now = nowUnix();
+  if (isSq()) {
+    const vis = dev.blocks.length ? nextVisible(0, now) : -1;
+    if (vis < 0) showStatus(dev.blocks.length ? "Forecast expired" : "No forecast data", dev.lastError || "retrying...");
+    else sqDraw(now);
+    renderTable(now, vis);
+    return;
+  }
   const idx = dev.blocks.length ? nextVisible(dev.page, now) : -1;
   if (idx < 0) {
     showStatus(dev.blocks.length ? "Forecast expired" : "No forecast data", dev.lastError || "retrying...");
@@ -402,11 +415,14 @@ async function doPoll() {
 
 async function setup() {
   dev = freshDevice(); simMs = 0; bootUnix = Date.now() / 1000;
-  L = layout(+$("sHeight").value);
-  display = new Display(128, +$("sHeight").value);
+  const panelH = isSq() ? 64 : +$("sHeight").value;
+  L = layout(panelH);
+  display = new Display(128, panelH);
   $("oled").height = display.h;
   $("serial").textContent = "";
-  serial(`SURFMOD v2 boot, panel 128x${display.h}`);
+  sq.page = 0; clearTimeout(sq.mapTimer);
+  updateViews();
+  serial(`SURFMOD v2 boot, panel ${isSq() ? "720x720 square" : "128x" + display.h}`);
   showStatus("SURFMOD v2", "booting...");
   busy = true;
   dev.failStreak = (await pollForecast()) ? 0 : 1;
@@ -419,12 +435,204 @@ async function setup() {
 function loop() {
   if (busy) return;
   if (simMs - dev.lastPoll >= pollInterval()) { doPoll(); return; }
+  if (isSq()) {
+    if (!map.on && simMs - dev.lastPage >= sqPageMs()) { sqGo(1); }
+    return;
+  }
   if (simMs - dev.lastPage >= PAGE_MS) {
     dev.page = dev.blocks.length ? (dev.page + 1) % dev.blocks.length : 0;
     dev.lastPage = simMs;
     drawPage();
   }
 }
+
+
+/* ───────────────────────── Square 5" display (720×720) design ─────────────────────────
+   Three pages, cycling: NOW (score ring, swell, wind, next 24h), NEXT 48H (bars + wind),
+   SWELL MAP (streamlines, stepping frames). Click the screen or Prev/Next to change page.
+   Data: the same /esp payload the OLED uses, plus the map JSON. */
+const SQ = 720, SQ_PAGE_MS = 9000;
+const SQ_PAGES = ["now", "outlook", "map"];
+const sq = { page: 0, mapTimer: 0, mapIdx: 0, token: 0 };
+const C = { bg: "#0b0f14", panel: "#141a22", line: "#232b36", text: "#e6edf3", muted: "#8b949e", dim: "#56606c" };
+const QUALITY = [  // same cut points as the API's quality_key
+  [0.85, "EPIC", "#a371f7"], [0.70, "GOOD", "#3fb950"], [0.60, "FAIR TO GOOD", "#9bc53d"], [0.50, "FAIR", "#d4a72c"],
+  [0.40, "POOR TO FAIR", "#f0883e"], [0.30, "POOR", "#e5534b"], [0.00, "FLAT", "#6e7681"]];
+const qual = r => QUALITY.find(([t]) => r >= t);
+const SQ_FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif";
+
+function sqCtx() {
+  const c = $("sq"), ctx = c.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, SQ, SQ);
+  ctx.textBaseline = "alphabetic";
+  return ctx;
+}
+function txt(ctx, s, x, y, size, color = C.text, weight = 400, align = "left") {
+  ctx.font = `${weight} ${size}px ${SQ_FONT}`; ctx.fillStyle = color; ctx.textAlign = align; ctx.fillText(s, x, y);
+  return ctx.measureText(s).width;
+}
+// Arrow pointing the way swell/wind travels (data is "coming from" degrees).
+function arrow(ctx, x, y, fromDeg, r, color) {
+  if (fromDeg == null) return;
+  ctx.save(); ctx.translate(x, y); ctx.rotate((fromDeg + 180) * Math.PI / 180);
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.moveTo(0, -r); ctx.lineTo(r * 0.62, r * 0.7); ctx.lineTo(0, r * 0.35); ctx.lineTo(-r * 0.62, r * 0.7); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function sqTz() { return window._islands?.[$("sIsland").value]?.timezone || undefined; }
+function sqClock(now) {
+  if (!now) return "--:--";
+  return new Date(now * 1000).toLocaleTimeString("en-GB", { timeZone: sqTz(), hour: "2-digit", minute: "2-digit" });
+}
+function sqVisible(now) { return dev.blocks.filter(b => blockVisible(b, now)); }
+function sqStale(now) { return !!dev.lastError || (now && dev.generatedAt && now - dev.generatedAt > STALE_S); }
+
+function sqHeader(ctx, now, subtitle) {
+  txt(ctx, dev.spotName, 40, 74, 40, C.text, 700);
+  txt(ctx, subtitle, 40, 108, 20, C.muted, 500);
+  txt(ctx, sqClock(now), SQ - 40, 74, 36, C.text, 600, "right");
+  const stale = sqStale(now);
+  ctx.fillStyle = stale ? "#d29922" : "#3fb950"; ctx.beginPath(); ctx.arc(SQ - 48, 99, 6, 0, 7); ctx.fill();
+  txt(ctx, stale ? (dev.lastError ? "offline" : "stale") : "live", SQ - 62, 106, 18, C.muted, 500, "right");
+}
+function sqDots(ctx) {
+  SQ_PAGES.forEach((_, i) => {
+    ctx.fillStyle = i === sq.page ? C.text : C.dim;
+    ctx.beginPath(); ctx.arc(SQ / 2 + (i - 1) * 22, SQ - 10, i === sq.page ? 5 : 4, 0, 7); ctx.fill();
+  });
+}
+
+function sqNow(ctx, now) {
+  const vis = sqVisible(now), v = vis[0];
+  const h0 = +v.timeLabel.split(" ")[1], range = `${String(h0).padStart(2, "0")}:00–${String((h0 + 3) % 24).padStart(2, "0")}:00`;
+  sqHeader(ctx, now, `${tagFor(v, now).trim() === "NOW" ? "Now" : tagFor(v, now).trim()} · ${v.timeLabel.split(" ")[0]} ${range}`);
+
+  // score ring
+  const [, label, col] = qual(v.rating), cx = 196, cy = 314, R = 124;
+  ctx.lineCap = "round"; ctx.lineWidth = 24;
+  ctx.strokeStyle = C.line; ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = col; ctx.beginPath(); ctx.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + Math.max(0.02, v.rating) * Math.PI * 2); ctx.stroke();
+  const w = txt(ctx, (v.rating * 10).toFixed(1), cx, cy + 26, 84, C.text, 700, "center");
+  txt(ctx, "/10", cx + w / 2 + 4, cy + 26, 24, C.muted, 500);
+  txt(ctx, label, cx, cy + R + 56, label.length > 8 ? 26 : 32, col, 700, "center");
+
+  // swell + wind
+  const x = 392;
+  txt(ctx, "SWELL", x, 214, 18, C.muted, 600);
+  txt(ctx, `${fmt(v.swellHeight, 1)} m`, x, 282, 68, C.text, 700);
+  txt(ctx, `${fmt(v.swellPeriod, 0)} s  ·  ${v.swellDir}`, x, 322, 28, C.muted, 500);
+  arrow(ctx, 650, 262, v.swellDeg, 26, C.text);
+  ctx.fillStyle = C.line; ctx.fillRect(x, 352, SQ - 40 - x, 2);
+  txt(ctx, "WIND", x, 396, 18, C.muted, 600);
+  txt(ctx, `${fmt(v.windSpeed, 0)} mph`, x, 452, 52, C.text, 700);
+  txt(ctx, v.windDir, x, 490, 28, C.muted, 500);
+  arrow(ctx, 650, 440, v.windDeg, 22, C.muted);
+
+  // next 24h strip
+  const next = vis.slice(0, 8), top = 590, base = 672, maxH = Math.max(1, ...next.map(b => b.swellHeight || 0));
+  const best = next.reduce((a, b) => (b.rating > a.rating ? b : a), next[0]);
+  txt(ctx, "NEXT 24 HOURS", 40, top - 12, 16, C.muted, 600);
+  const bw = (SQ - 80) / 8;
+  next.forEach((b, i) => {
+    const bx = 40 + i * bw + 4, h = 12 + (b.swellHeight || 0) / maxH * 50;
+    ctx.fillStyle = qual(b.rating)[2]; ctx.globalAlpha = b === best ? 1 : 0.75;
+    ctx.beginPath(); ctx.roundRect(bx, base - h, bw - 8, h, 6); ctx.fill(); ctx.globalAlpha = 1;
+    if (i === 0) { ctx.strokeStyle = C.text; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(bx - 3, base - h - 3, bw - 2, h + 6, 8); ctx.stroke(); }
+    txt(ctx, b.timeLabel.split(" ")[1], bx + (bw - 8) / 2, base + 24, 18, i === 0 ? C.text : C.muted, 500, "center");
+    if (b === best && i > 0 && b.rating >= 0.4) txt(ctx, "BEST", bx + (bw - 8) / 2, base - h - 10, 14, C.text, 700, "center");
+  });
+}
+
+function sqOutlook(ctx, now) {
+  const vis = sqVisible(now).slice(0, 16);
+  sqHeader(ctx, now, "Next 48 hours");
+  const left = 40, right = SQ - 40, top = 170, base = 470, n = vis.length || 1, bw = (right - left) / n;
+  const maxH = Math.max(1, ...vis.map(b => b.swellHeight || 0));
+  // grid + scale
+  ctx.strokeStyle = C.line; ctx.lineWidth = 1;
+  for (const f of [0.5, 1]) { const y = base - f * (base - top); ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+    txt(ctx, `${(maxH * f).toFixed(1)}m`, right, y - 6, 14, C.dim, 500, "right"); }
+  let lastDay = null;
+  vis.forEach((b, i) => {
+    const x = left + i * bw, h = 6 + (b.swellHeight || 0) / maxH * (base - top - 6), [, , col] = qual(b.rating);
+    const day = b.timeLabel.split(" ")[0];
+    if (day !== lastDay) {
+      if (i) { ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, top - 30); ctx.lineTo(x, base + 120); ctx.stroke(); }
+      txt(ctx, day.toUpperCase(), x + 6, top - 12, 16, C.muted, 700); lastDay = day;
+    }
+    ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(x + 3, base - h, bw - 6, h, 4); ctx.fill();
+    arrow(ctx, x + bw / 2, base + 40, b.windDeg, 10, C.muted);
+    txt(ctx, fmt(b.windSpeed, 0), x + bw / 2, base + 76, 15, C.muted, 500, "center");
+    if (i % 2 === 0) txt(ctx, b.timeLabel.split(" ")[1], x + bw / 2, base + 104, 14, C.dim, 500, "center");
+  });
+  txt(ctx, "WIND mph", left, base + 132, 13, C.dim, 600);
+  if (!vis.length) return;
+  const best = vis.reduce((a, b) => (b.rating > a.rating ? b : a), vis[0]), [, label, col] = qual(best.rating);
+  ctx.fillStyle = C.panel; ctx.beginPath(); ctx.roundRect(40, 622, SQ - 80, 64, 12); ctx.fill();
+  if (best.rating < 0.4) { txt(ctx, "Nothing worth paddling out for in the next 48h", SQ / 2, 662, 22, C.muted, 500, "center"); return; }
+  txt(ctx, "BEST", 62, 662, 18, C.muted, 700);
+  txt(ctx, `${best.timeLabel}:00`, 124, 664, 26, C.text, 600);
+  txt(ctx, `${label}  ${(best.rating * 10).toFixed(1)}`, SQ - 62, 664, 26, col, 700, "right");
+}
+
+async function sqMap(ctx, now, token) {
+  const key = T.area === "global" ? "global" : $("sIsland").value;
+  if (map.key !== key) {
+    txt(ctx, "Loading swell map…", SQ / 2, SQ / 2, 26, C.muted, 500, "center");
+    const ok = await loadMap();
+    if (token !== sq.token) return false;          // page changed while loading
+    if (!ok) { sqStatus("No swell map", "data unavailable"); return false; }
+    ctx = sqCtx();
+  }
+  const frames = mapFrames(), f = frames[Math.min(sq.mapIdx, frames.length - 1)];
+  const t = map.data.times[f], hrs = Math.max(0, Math.round((t - Date.now() / 1000) / 3600));
+  txt(ctx, `${map.data.island} swell`, 40, 74, 36, C.text, 700);
+  txt(ctx, hrs ? `+${hrs}h` : "Now", SQ - 40, 74, 36, C.text, 600, "right");
+  txt(ctx, new Date(t * 1000).toLocaleString("en-GB", { timeZone: map.data.timezone || "UTC", weekday: "short", hour: "2-digit", minute: "2-digit" }),
+      SQ - 40, 104, 18, C.muted, 500, "right");
+  const { lo, hi } = renderMap(ctx, { x: 20, y: 124, w: SQ - 40, h: 520 }, f, 1);
+  // legend + frame dots
+  const g = ctx.createLinearGradient(40, 0, 220, 0);
+  [0, .25, .5, .75, 1].forEach(s => g.addColorStop(s, cmap(s)));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(84, 668, 136, 8, 4); ctx.fill();
+  txt(ctx, `${lo.toFixed(1)}m`, 40, 677, 14, C.muted, 500);
+  txt(ctx, `${hi.toFixed(1)}m`, 228, 677, 14, C.muted, 500);
+  frames.forEach((_, i) => { ctx.fillStyle = i === sq.mapIdx ? C.text : C.dim; ctx.beginPath(); ctx.arc(SQ - 40 - (frames.length - 1 - i) * 14, 672, i === sq.mapIdx ? 4 : 3, 0, 7); ctx.fill(); });
+  return true;
+}
+
+function sqStatus(l1, l2) {
+  const ctx = sqCtx();
+  txt(ctx, l1, SQ / 2, SQ / 2 - 10, 34, C.text, 700, "center");
+  if (l2) txt(ctx, l2, SQ / 2, SQ / 2 + 34, 22, C.muted, 500, "center");
+}
+
+function sqDraw(now) {
+  const ctx = sqCtx(), page = SQ_PAGES[sq.page], token = ++sq.token;
+  clearTimeout(sq.mapTimer);
+  if (page === "now") sqNow(ctx, now);
+  else if (page === "outlook") sqOutlook(ctx, now);
+  else {
+    sqMap(ctx, now, token).then(ok => { if (ok && token === sq.token) sqDots($("sq").getContext("2d")); });
+    const frames = map.data ? mapFrames() : [];
+    sq.mapTimer = setTimeout(() => { sq.mapIdx = (sq.mapIdx + 1) % Math.max(1, frames.length); if (SQ_PAGES[sq.page] === "map") sqDraw(nowUnix()); },
+                             T.frameMs + (sq.mapIdx === frames.length - 1 ? T.holdMs : 0));
+    return;
+  }
+  sqDots(ctx);
+}
+function sqPageMs() {
+  if (SQ_PAGES[sq.page] !== "map" || !map.data) return SQ_PAGE_MS * +$("sSpeed").value;
+  const n = mapFrames().length;      // map page: one full loop of frames (in sim time)
+  return (n * T.frameMs + T.holdMs) * +$("sSpeed").value;
+}
+function sqGo(d) {
+  sq.page = (sq.page + d + SQ_PAGES.length) % SQ_PAGES.length;
+  sq.mapIdx = 0; dev.lastPage = simMs;
+  drawPage();
+}
+$("sqView").onclick = () => sqGo(1);
 
 /* ───────────────────────── Rendering + UI ───────────────────────── */
 function paint() {
@@ -516,8 +724,9 @@ document.querySelectorAll("[data-fault]").forEach(b => b.addEventListener("click
   drawPage();
 }));
 $("bPoll").onclick = () => { if (!busy) doPoll(); };
-$("bNext").onclick = () => { if (dev.blocks.length) { dev.page = (dev.page + 1) % dev.blocks.length; dev.lastPage = simMs; drawPage(); } };
+$("bNext").onclick = () => { if (isSq()) return sqGo(1); if (dev.blocks.length) { dev.page = (dev.page + 1) % dev.blocks.length; dev.lastPage = simMs; drawPage(); } };
 $("bPrev").onclick = () => {
+  if (isSq()) return sqGo(-1);
   const n = dev.blocks.length, now = nowUnix(); if (!n) return;
   let i = dev.page; for (let k = 0; k < n; k++) { i = (i - 1 + n) % n; if (blockVisible(dev.blocks[i], now)) break; }
   dev.page = i; dev.lastPage = simMs; drawPage();
@@ -690,13 +899,12 @@ function streamlines(f, aspect) {
   return lines;
 }
 
-/* projection: equirectangular, aspect-correct, letterboxed (local maps squash longitude by cos(lat)) */
-function projection(W, H) {
+/* projection: equirectangular, aspect-correct, letterboxed inside box (local maps squash longitude by cos(lat)) */
+function projection(box) {
   const D = map.data, lon0 = D.lons[0], lon1 = D.lons.at(-1), lat0 = D.lats[0], lat1 = D.lats.at(-1);
   const k = map.key === "global" ? 1 : Math.cos((lat0 + lat1) / 2 * Math.PI / 180);
-  const top = H * 0.11, bot = H * 0.1, pad = W * 0.02;
-  const bw = W - 2 * pad, bh = H - top - bot, geo = (lon1 - lon0) * k / (lat1 - lat0);
-  const w = Math.min(bw, bh * geo), h = w / geo, x0 = pad + (bw - w) / 2, y0 = top + (bh - h) / 2;
+  const bw = box.w, bh = box.h, geo = (lon1 - lon0) * k / (lat1 - lat0);
+  const w = Math.min(bw, bh * geo), h = w / geo, x0 = box.x + (bw - w) / 2, y0 = box.y + (bh - h) / 2;
   const px = lon => x0 + (lon - lon0) / (lon1 - lon0) * w, py = lat => y0 + (lat1 - lat) / (lat1 - lat0) * h;
   return { x0, y0, w, h, px, py, aspect: w / h,
            gx: fx => px(lon0 + fx / (D.lons.length - 1) * (lon1 - lon0)),
@@ -729,11 +937,9 @@ function landPath(ctx, P, polys) {
   }
 }
 
-function drawMapFrame(f, alpha = 1) {
-  const D = map.data, { c, W, H } = mapCanvas(), ctx = c.getContext("2d"), P = projection(W, H);
-  const scale = W / 900;
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, W, H);
+// Draw frame f of the swell map into box {x, y, w, h} of ctx. Returns the colour range used.
+function renderMap(ctx, box, f, alpha = 1) {
+  const D = map.data, P = projection(box), scale = box.w / 880;
   ctx.save(); ctx.beginPath(); ctx.rect(P.x0, P.y0, P.w, P.h); ctx.clip();
 
   const polys = map.land[map.key === "global" ? "110m" : "50m"] || [];
@@ -743,7 +949,7 @@ function drawMapFrame(f, alpha = 1) {
   let lo = map.hmin, hi = map.hmax;
   if (T.scale === "frame") { const hs = D.h[f].flat().filter(v => v != null); lo = Math.min(...hs); hi = Math.max(...hs); }
   const span = Math.max(hi - lo, 0.1);
-  const lines = map.cache[f] ??= streamlines(f, P.aspect);
+  const lines = map.cache[`${f}|${P.aspect.toFixed(2)}`] ??= streamlines(f, P.aspect);
   ctx.save();
   if (T.clipSea && polys.length) {   // ocean = view box minus land (even-odd), so lines stop at the real coast
     ctx.beginPath(); ctx.rect(P.x0, P.y0, P.w, P.h);
@@ -777,6 +983,14 @@ function drawMapFrame(f, alpha = 1) {
     ctx.fillText(m.name, mx + 8 * scale, my - 6 * scale);
   }
   ctx.restore();
+  return { lo, hi };
+}
+
+function drawMapFrame(f, alpha = 1) {
+  const D = map.data, { c, W, H } = mapCanvas(), ctx = c.getContext("2d");
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, W, H);
+  const { lo, hi } = renderMap(ctx, { x: W * 0.02, y: H * 0.11, w: W * 0.96, h: H * 0.79 }, f, alpha);
 
   // labels
   document.querySelector(".ramp").style.background = `linear-gradient(90deg, ${[0, .25, .5, .75, 1].map(cmap).join(",")})`;
@@ -840,11 +1054,18 @@ async function loadMap() {
   return false;
 }
 
+function updateViews() {
+  $("oledView").classList.toggle("hidden", map.on || isSq());
+  $("sqView").classList.toggle("hidden", map.on || !isSq());
+  $("mapView").classList.toggle("hidden", !map.on);
+  $("sColorWrap").classList.toggle("hidden", isSq());
+}
+
 async function toggleMap(force) {
   map.on = force ?? !map.on;
   $("bMap").classList.toggle("active", map.on);
-  $("oledView").classList.toggle("hidden", map.on);
-  $("mapView").classList.toggle("hidden", !map.on);
+  updateViews();
+  if (!map.on && isSq()) drawPage();
   $("tuneCard").classList.toggle("hidden", !map.on);
   clearTimeout(map.timer);
   if (!map.on) return;

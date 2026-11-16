@@ -95,6 +95,22 @@ to paste into `MAP_DEFAULTS` in `simulator/index.html` to make it the default.
 The readout is offshore swell. The OLED shows what reaches the chosen spot after
 shadowing, so a sheltered spot can read 0.1m while the map shows 2m.
 
+## Square display (5", design proof of concept)
+
+Simulator **Panel → Square 5" 720×720**. Three pages, 9s each (map page runs
+one full loop of frames); click the screen or Prev/Next to change page:
+
+1. **Now:** spot, local time, live/stale dot, 0-10 score ring in the quality
+   colour, swell and wind with direction arrows, next 24h strip with the best
+   window tagged.
+2. **Next 48 hours:** a bar per 3h block (height = swell, colour = quality),
+   wind arrows and speeds, day dividers, best window callout.
+3. **Swell map:** the streamline map (uses the Map tuning settings).
+
+Data is the same `/esp/<island>` payload as the OLED, plus `map/<region>.json`.
+Quality colours use the API's `quality_key` cut points. 720×720 is a
+placeholder resolution until a panel is chosen; the layout is in canvas units.
+
 ## Home relay (temporary fix for 429s on Render)
 
 Render's shared IP runs out of Open-Meteo's free quota. Until there is an API
