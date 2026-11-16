@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover
     raise SystemExit("Python 3.9+ required")
 
 import surfdeck
+import coast
 from surfdeck import (
     SpotConfig,
     UpstreamError,
@@ -520,6 +521,17 @@ def debug_upstream(lat: float = 32.30, lon: float = -64.80):
         except surfdeck.UpstreamError as e:
             out[name] = {"status": "error", "reason": str(e)}
     return out
+
+
+@app.get("/spot/suggest")
+def spot_suggest(lat: float = Query(..., ge=-85, le=85), lon: float = Query(..., ge=-180, le=180),
+                 break_type: str = Query("beach", pattern="^(beach|reef|point|rivermouth)$")):
+    """Suggest swell window, ideal swell, shadow zones and offshore wind from the coastline.
+    The direction fields drop straight into POST /forecast. Check `confidence` and `notes`."""
+    try:
+        return coast.suggest(lat, lon, break_type)
+    except coast.CoastError as e:
+        raise HTTPException(status_code=503, detail=f"Map tiles unavailable: {e}")
 
 
 @app.get("/health")

@@ -107,6 +107,29 @@ otherwise mean x 1.35. Checked against 8 NOAA buoys on 2026-11-16: mean absolute
 buoy peak period 3.3 s -> 1.9 s overall, about 3.9 s -> 1.2 s at groundswell buoys. Buoys
 dominated by local wind chop (dominant period under 9 s) don't compare like for like.
 
+## Suggest a spot's directions: GET /spot/suggest
+
+`GET /spot/suggest?lat=&lon=&break_type=beach|reef|point|rivermouth`
+
+Works out the swell window and offshore wind from the coastline (OpenStreetMap ocean polygons
+via OpenFreeMap; credit `attribution`). Use it for a "Calculate" button when creating a break,
+then let the user edit the values.
+
+- **Returns** `swell_dir_min`, `swell_dir_max`, `swell_dir_ideal`, `shadow_zones`,
+  `wind_offshore_min`, `wind_offshore_max`: these drop straight into `POST /forecast`.
+- **Also** `facing_deg` (the way the shore faces), `confidence` (0-1), `notes`, `pin` (where it
+  measured; a pin on the sand is moved up to 1 km onto the water) and `fetch_km` (open water per
+  bearing, for drawing the window).
+- **`status`**: `ok`, `inland` (no sea within 1 km), `open-water` (no coast within 1 km) or
+  `enclosed` (every seaward direction meets land). Only `ok` has direction fields.
+- **503** if the map tiles can't be reached. Takes about 0.5-2 s; tiles are cached for a day.
+- **How it works:** facing = mean direction of water on rings out to 3 km; a ray every 5° across
+  the seaward half measures open water to 150 km; bearings with too little open water are outside
+  the window, or shadow zones if inside it; offshore wind = facing + 180 ± 45.
+- **Accuracy (42 test breaks, compared with approximate known facings, unverified):** beaches
+  usually within ~20°; reefs and points often 30-130° off, because their best swell depends on
+  the seabed, not the shoreline. Reef and point results carry lower `confidence` and a note.
+
 ## Device payload
 
 `POST /esp?blocks=8` takes the same body as `/forecast` and returns the compact
