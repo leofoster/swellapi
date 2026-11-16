@@ -278,6 +278,18 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
             _cache[key] = (now, None, msg)
         raise NoCoverageError(msg)
 
+    # Peak periods. Open-Meteo's default swell_wave_period is a MEAN period; surfers (and
+    # Surfline, and buoys' "dominant period") use the PEAK period, typically 3-5 s longer for
+    # groundswell. Native peak period only exists in some regions, so NOAA GFS-Wave's swell
+    # periods are fetched too (they track buoy peak periods closely). Optional: on failure the
+    # mean x PEAK_RATIO estimate is used.
+    try:
+        gfs = _get_json("marine", {**common, "cell_selection": "sea", "models": "ncep_gfswave025", "hourly": [
+            "swell_wave_period", "swell_wave_direction", "secondary_swell_wave_period", "secondary_swell_wave_direction",
+        ]}, "marine (gfs periods)")["hourly"]
+    except UpstreamError:
+        gfs = None
+
     tz_name = weather.get("timezone") or marine.get("timezone") or "UTC"
     try:
         tz = ZoneInfo(tz_name)
@@ -305,10 +317,18 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
 
     # Align on timestamp rather than index, in case the two models differ in length.
     w_idx = {t: i for i, t in enumerate(wh["time"])}
+    g_idx = {t: i for i, t in enumerate(gfs["time"])} if gfs else {}
     rows = []
     for i, t in enumerate(mh["time"]):
         j = w_idx.get(t)
+        gi = g_idx.get(t)
         t_local = datetime.fromisoformat(t).replace(tzinfo=tz)
+        p1, src1 = peak_period(mh["swell_wave_period"][i], mh["swell_wave_direction"][i], mh["swell_wave_peak_period"][i],
+                               g(gfs.get("swell_wave_period"), gi) if gfs else None,
+                               g(gfs.get("swell_wave_direction"), gi) if gfs else None)
+        p2, _ = peak_period(g(mh.get("secondary_swell_wave_period"), i), g(mh.get("secondary_swell_wave_direction"), i), None,
+                            g(gfs.get("secondary_swell_wave_period"), gi) if gfs else None,
+                            g(gfs.get("secondary_swell_wave_direction"), gi) if gfs else None)
         rows.append({
             "time":                to_utc(t),
             "swell_height_m":      mh["swell_wave_height"][i],
@@ -321,6 +341,9 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
             "wind_speed_mph":      wh["wind_speed_10m"][j] if j is not None else None,
             "wind_direction_deg":  wh["wind_direction_10m"][j] if j is not None else None,
             "wind_gusts_mph":      wh["wind_gusts_10m"][j] if j is not None else None,
+            "swell_peak_period_s": p1,
+            "period_source":       src1,
+            "swell2_peak_period_s": p2,
             "swell2_height_m":     g(mh.get("secondary_swell_wave_height"), i),
             "swell2_direction_deg": g(mh.get("secondary_swell_wave_direction"), i),
             "swell2_period_s":     g(mh.get("secondary_swell_wave_period"), i),
@@ -341,6 +364,22 @@ def fetch_forecast(lat: float, lon: float) -> tuple[list[dict], str]:
     with _cache_lock:
         _cache[key] = (now, rows, tz_name)
     return rows, tz_name
+
+
+PEAK_RATIO = 1.35   # buoy peak / model mean period, measured at NOAA buoys 2026-11-16 (14-17 s swell)
+
+
+def peak_period(mean: Optional[float], direction: Optional[float], native_peak: Optional[float],
+                gfs_period: Optional[float], gfs_dir: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    """Best available peak period for one swell train, and where it came from."""
+    if native_peak and 3 < native_peak < 25:
+        return round(native_peak, 1), "model-peak"
+    if (gfs_period and 3 < gfs_period < 25 and mean and gfs_period >= mean * 0.9
+            and direction is not None and gfs_dir is not None and ang_diff(direction, gfs_dir) <= 45):
+        return round(gfs_period, 1), "gfs-wave"          # same swell (direction agrees), peak-like period
+    if mean:
+        return round(mean * PEAK_RATIO, 1), "estimated"
+    return None, None
 
 
 def fetch_open_meteo(lat: float, lon: float) -> list[dict]:
@@ -739,6 +778,7 @@ def infer_spot_v1(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
 # ─────────────────────────────────────────────────────────────────
 # Changes from v1 (each is a guess until checked against real session ratings):
 #  - every swell train counts (primary + secondary), combined by energy
+#  - periods are PEAK periods (what surfers and Surfline quote), not model mean periods
 #  - height is period-aware: longer period surfs bigger (scaled to a 10s reference,
 #    so existing height preferences keep their meaning)
 #  - direction falls off smoothly outside the window instead of a cliff
@@ -749,7 +789,7 @@ G = 9.81
 GLASSY_MPH = 5.0        # at or below this, wind direction barely matters
 GLASSY_BLEND_MPH = 5.0  # blend from glassy to normal scoring over the next 5 mph
 GUSTY_DELTA_MPH = 10.0  # gusts this far above the mean wind cost 0.1
-REF_PERIOD_S = 10.0
+REF_PERIOD_S = 12.0    # peak-period reference (was 10 s with mean periods; same calibration)
 DIR_FALLOFF = 2.0       # direction factor reaches 0 at 90/DIR_FALLOFF = 45 deg outside the window
 ENGINE_WEIGHTS = {
     "beach": {"dir": 0.30, "period": 0.25, "height": 0.25, "wind": 0.20},
@@ -834,13 +874,15 @@ def score_wind_v2(wdir: Optional[float], wspd: Optional[float], gust: Optional[f
 
 def infer_spot_v2(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
     trains = []
-    for hk, pk, dk in (("swell_height_m", "swell_period_s", "swell_direction_deg"),
-                       ("swell2_height_m", "swell2_period_s", "swell2_direction_deg")):
-        h, p, d = hour.get(hk), hour.get(pk), hour.get(dk)
+    for hk, pk, mk, dk in (("swell_height_m", "swell_peak_period_s", "swell_period_s", "swell_direction_deg"),
+                           ("swell2_height_m", "swell2_peak_period_s", "swell2_period_s", "swell2_direction_deg")):
+        h, d = hour.get(hk), hour.get(dk)
+        p = hour.get(pk) or hour.get(mk)                       # peak period; mean if that's all there is
         if h and h > 0.05 and p and d is not None:
             trains.append(swell_component(h, p, d, spot))
     if not trains:
-        trains = [swell_component(0.0, hour.get("swell_period_s") or 1, hour.get("swell_direction_deg") or 0, spot)]
+        trains = [swell_component(0.0, hour.get("swell_peak_period_s") or hour.get("swell_period_s") or 1,
+                                  hour.get("swell_direction_deg") or 0, spot)]
 
     energy = [t["h_eq"] ** 2 for t in trains]
     total = sum(energy)

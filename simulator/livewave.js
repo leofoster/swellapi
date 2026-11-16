@@ -283,10 +283,10 @@ export function paramsFromHour(hour, spot = {}, geo = null, dayHours = null) {
   }
   const p = {
     hb: clamp(surf, 0.1, 6),
-    T: clamp(hour.swell_period_s ?? 10, 4, 22),
+    T: clamp(hour.swell_peak_period_s ?? hour.swell_period_s ?? 10, 4, 22),   // peak period when available
     dir: hour.swell_direction_deg ?? 270,                       // degrees the swell comes FROM
     h2: hour.secondary_swell_height_m ?? 0,
-    T2: hour.secondary_swell_period_s ?? 0,
+    T2: hour.secondary_swell_peak_period_s ?? hour.secondary_swell_period_s ?? 0,
     dir2: hour.secondary_swell_direction_deg ?? null,
     windMph: hour.wind_speed_mph ?? 0,
     windDeg: hour.wind_direction_deg ?? 0,                      // degrees the wind comes FROM

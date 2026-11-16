@@ -47,7 +47,9 @@ Response:
             hours: [ { time,                     // ISO with local offset
                        hour_label, hours_from_now,
                        swell_height_m, swell_period_s, swell_direction_deg, swell_direction_compass,
-                       secondary_swell_height_m, secondary_swell_period_s,
+                       swell_peak_period_s,      // PEAK period: what surfers / Surfline quote. Display this.
+                       period_source,            // model-peak | gfs-wave | estimated (mean x 1.35)
+                       secondary_swell_height_m, secondary_swell_period_s, secondary_swell_peak_period_s,
                        secondary_swell_direction_deg, secondary_swell_direction_compass,
                        surf_height_m,            // v2: breaking-height estimate, for display
                        daylight,                 // true / false / null (unknown)
@@ -93,6 +95,18 @@ Works for any coordinate with ocean wave data nearby. What changed from v1:
 Expect v2 scores to run higher than v1 where secondary swells exist (in a
 worldwide spot check, +0.3 to +1.1 on the 0-10 average).
 
+## Swell period: mean vs peak
+
+`swell_period_s` is the model's **mean** period. Surfers, Surfline and buoys' "dominant
+period" use the **peak** period, typically 3-5 s longer for groundswell. Display
+`swell_peak_period_s`. Engine v2 scores and sizes with the peak period; v1 still uses the mean.
+
+Peak period source, best first: the model's native peak period (only some regions), NOAA
+GFS-Wave's swell period when its direction agrees with the main model's (within 45 deg),
+otherwise mean x 1.35. Checked against 8 NOAA buoys on 2026-11-16: mean absolute error vs
+buoy peak period 3.3 s -> 1.9 s overall, about 3.9 s -> 1.2 s at groundswell buoys. Buoys
+dominated by local wind chop (dominant period under 9 s) don't compare like for like.
+
 ## Device payload
 
 `POST /esp?blocks=8` takes the same body as `/forecast` and returns the compact
@@ -102,7 +116,7 @@ built-in islands, and is also published statically (see RUNBOOK.md).
 ```
 { v: 2, s: spot name, g: generated ISO, gt: generated unix,
   b: [ { t: "Mon 15" (local), e: block start unix, hn, h, p, sd, sg, w, wd, wg,
-         r: 0-1, q: PUMPING|GOOD|FAIR|POOR|FLAT,
+         r: 0-1, q: PUMPING|GOOD|FAIR|POOR|FLAT,          // p is the PEAK period
          dl: daylight (bool|null), sh: surf height estimate m (v2) } ] }
 ```
 

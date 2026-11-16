@@ -82,8 +82,11 @@ class HourlyReading(BaseModel):
     wind_direction_compass: str
     wind_gusts_mph:      Optional[float]
 
+    swell_peak_period_s: Optional[float] = None   # peak period: what surfers / Surfline quote. Show this.
+    period_source:       Optional[str] = None     # model-peak | gfs-wave | estimated (mean x 1.35)
     secondary_swell_height_m:      Optional[float] = None
     secondary_swell_period_s:      Optional[float] = None
+    secondary_swell_peak_period_s: Optional[float] = None
     secondary_swell_direction_deg: Optional[float] = None
     secondary_swell_direction_compass: str = "---"
     surf_height_m:       Optional[float] = None   # v2: breaking-height estimate (Komar & Gaughan)
@@ -202,7 +205,10 @@ def build_hourly_reading(hour: dict, spot: SpotConfig, buoy_summary: Optional[di
         wind_direction_deg=hour.get("wind_direction_deg"),
         wind_direction_compass=deg_to_compass(hour.get("wind_direction_deg")),
         wind_gusts_mph=hour.get("wind_gusts_mph"),
+        swell_peak_period_s=hour.get("swell_peak_period_s"),
+        period_source=hour.get("period_source"),
         secondary_swell_height_m=hour.get("swell2_height_m"),
+        secondary_swell_peak_period_s=hour.get("swell2_peak_period_s"),
         secondary_swell_period_s=hour.get("swell2_period_s"),
         secondary_swell_direction_deg=hour.get("swell2_direction_deg"),
         secondary_swell_direction_compass=deg_to_compass(hour.get("swell2_direction_deg")),
@@ -363,7 +369,7 @@ class EspBlock(BaseModel):
     e:  int              # block start, unix seconds. Devices compute "+Nh" from this.
     hn: int              # hours from generation time to block start (legacy; prefer e)
     h:  Optional[float]  # effective swell height m
-    p:  Optional[float]  # swell period s
+    p:  Optional[float]  # swell PEAK period s
     sd: str              # swell direction compass
     sg: Optional[float]  # swell direction deg
     w:  Optional[float]  # wind mph
@@ -403,7 +409,7 @@ def esp_from_forecast(full: ForecastResponse, blocks: int, now: datetime) -> Esp
         sdeg  = _circular_mean([h.swell_direction_deg for h in chunk])
         wdeg  = _circular_mean([h.wind_direction_deg for h in chunk])
         height = safe_mean([h.effective_height_m for h in chunk])
-        period = safe_mean([h.swell_period_s for h in chunk])
+        period = safe_mean([h.swell_peak_period_s or h.swell_period_s for h in chunk])   # peak, as surfers read it
         wind   = safe_mean([h.wind_speed_mph for h in chunk])
         out.append(EspBlock(
             t=start.astimezone(tz).strftime("%a %H"),
