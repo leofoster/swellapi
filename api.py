@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover
 
 import surfdeck
 import coast
+import calibrate as calib
 import buoys
 from surfdeck import (
     SpotConfig,
@@ -534,13 +535,41 @@ def debug_upstream(lat: float = 32.30, lon: float = -64.80):
 
 @app.get("/spot/suggest")
 def spot_suggest(lat: float = Query(..., ge=-85, le=85), lon: float = Query(..., ge=-180, le=180),
-                 break_type: str = Query("beach", pattern="^(beach|reef|point|rivermouth)$")):
+                 break_type: str = Query("beach", pattern="^(beach|reef|point|rivermouth)$"),
+                 peel_deg: Optional[float] = Query(None, ge=0, lt=360,
+                                                   description="Bearing the wave peels toward (reef/point)"),
+                 hand: Optional[str] = Query(None, pattern="^(left|right)$",
+                                             description="Or just left / right, as the surfer rides it")):
     """Suggest swell window, ideal swell, shadow zones and offshore wind from the coastline.
-    The direction fields drop straight into POST /forecast. Check `confidence` and `notes`."""
+    The direction fields drop straight into POST /forecast. Check `confidence` and `notes`.
+    For reefs and points, pin the peak and pass peel_deg or hand."""
     try:
-        return coast.suggest(lat, lon, break_type)
+        return coast.suggest(lat, lon, break_type, peel_deg=peel_deg, hand=hand)
     except coast.CoastError as e:
         raise HTTPException(status_code=503, detail=f"Map tiles unavailable: {e}")
+
+
+class SessionReport(BaseModel):
+    time:              Optional[str]   = None
+    observed_surf_ft:  Optional[float] = Field(None, ge=0, le=100, description="Height of the sets, feet")
+    observed_surf_m:   Optional[float] = Field(None, ge=0, le=30, description="Or metres")
+    rating:            Optional[int]   = Field(None, ge=1, le=5, description="How good it was, 1-5")
+    forecast_surf_m:   Optional[float] = Field(None, ge=0, description="surf_height_m shown for that hour")
+    forecast_score:    Optional[float] = Field(None, ge=0, le=1, description="score_overall shown for that hour")
+    swell_direction_deg: Optional[float] = Field(None, ge=0, lt=360)
+    height_scale_used: Optional[float] = Field(None, gt=0, le=3, description="Spot's height_scale when forecast")
+
+
+class CalibrateRequest(BaseModel):
+    reports:         list[SessionReport] = Field(..., max_length=500)
+    height_scale:    float = Field(1.0, gt=0, le=3, description="Spot's current height_scale")
+    swell_dir_ideal: Optional[float] = Field(None, ge=0, lt=360, description="Spot's current ideal")
+
+
+@app.post("/spot/calibrate")
+def spot_calibrate(req: CalibrateRequest):
+    """Suggest height_scale and swell_dir_ideal for one spot from its session reports. Stateless."""
+    return calib.calibrate([r.model_dump() for r in req.reports], req.height_scale, req.swell_dir_ideal)
 
 
 @app.get("/buoys/near")

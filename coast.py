@@ -309,8 +309,24 @@ def _runs(flags):
     return out
 
 
-def suggest(lat: float, lon: float, break_type: str = "beach") -> dict:
-    """SpotRequest direction fields for a pin. Raises CoastError only if map tiles are unreachable."""
+# ideal swell comes this far round from the reef normal, from up the line, so the wave peels.
+# Points wrap swell more than reefs. Heuristic, checked against 8 known breaks (2026-11-16).
+PEEL_SWELL_OFFSET = {"point": 45, "reef": 20, "beach": 20, "rivermouth": 20}
+
+
+def sdiff(a, b):
+    """Signed a - b in degrees, -180..180."""
+    return ((a - b + 540) % 360) - 180
+
+
+def suggest(lat: float, lon: float, break_type: str = "beach",
+            peel_deg: Optional[float] = None, hand: Optional[str] = None) -> dict:
+    """SpotRequest direction fields for a pin. Raises CoastError only if map tiles are unreachable.
+
+    Reefs and points: put the pin on the peak and give either `peel_deg` (the compass bearing the
+    wave peels toward, e.g. from a drag on the map) or `hand` ("left" / "right", as the surfer
+    rides it). The reef is taken to run along the peel line, facing the sea; the ideal swell comes
+    PEEL_SWELL_OFFSET degrees round from up the line, so the wave peels rather than closes out."""
     _prefetch(lat, lon)
     snapped = snap_to_water(lat, lon)
     if not snapped:
@@ -321,9 +337,23 @@ def suggest(lat: float, lon: float, break_type: str = "beach") -> dict:
         return {"status": "open-water", "pin": {"lat": round(plat, 5), "lon": round(plon, 5)},
                 "notes": ["No coastline within 1 km. Move the pin closer to the break."]}
 
-    # seaward half, every STEP_DEG, as one arc from face-90 to face+90
+    reef_face, target, marked = face, face, False
+    if peel_deg is not None:
+        peel_deg = norm(peel_deg)
+        reef_face = min((norm(peel_deg + 90), norm(peel_deg - 90)), key=lambda c: ang_diff(c, face))
+        marked = True
+    elif hand in ("left", "right"):
+        peel_deg = norm(face + 90) if hand == "left" else norm(face - 90)   # surfer faces the shore
+        marked = True
+    if marked:
+        up = norm(peel_deg + 180)                              # the swell comes from up the line
+        target = norm(reef_face + math.copysign(PEEL_SWELL_OFFSET.get(break_type, 20), sdiff(up, reef_face)))
+        hand = "left" if ang_diff(peel_deg, norm(reef_face + 90)) < 90 else "right"
+
+    # seaward half, every STEP_DEG, as one arc from reef_face-90 to reef_face+90
     offs = list(range(-90, 91, STEP_DEG))
-    bearings = [norm(round(face / STEP_DEG) * STEP_DEG + o) for o in offs]
+    centre = round(reef_face / STEP_DEG) * STEP_DEG
+    bearings = [norm(centre + o) for o in offs]
     fetch = [fetch_km(plat, plon, b) for b in bearings]
     longest = max(fetch)
     need = max(min(OPEN_MIN_KM, longest), OPEN_FRAC * longest)
@@ -334,19 +364,24 @@ def suggest(lat: float, lon: float, break_type: str = "beach") -> dict:
     if not runs:
         return {"status": "enclosed", "pin": {"lat": round(plat, 5), "lon": round(plon, 5)},
                 "facing_deg": round(face), "notes": ["Every seaward direction meets land quickly (enclosed bay or lagoon)."]}
-    # ideal: the facing bearing if open, else the nearest open bearing
-    ideal_i = min((i for i, o in enumerate(open_) if o), key=lambda i: abs(i - mid))
+    # ideal: the target bearing if open, else the nearest open bearing
+    want = mid + round(sdiff(target, centre) / STEP_DEG)
+    ideal_i = min((i for i, o in enumerate(open_) if o), key=lambda i: abs(i - want))
     i0, i1 = runs[0][0], runs[-1][1]                      # outer extent of the open bearings
     shadows = [[bearings[a], bearings[b]] for a, b in _runs([not o for o in open_[i0:i1 + 1]])
                for a, b in [(a + i0, b + i0)] if (b - a + 1) * STEP_DEG >= 10]
 
     notes = []
     conf = clarity * (1.0 if moved < 0.3 else 0.7)
-    if break_type in ("reef", "point"):
+    if marked:
+        conf *= 0.9
+        notes.append(f"Using your marked peel ({hand}): reef faces {round(reef_face)}, ideal swell set "
+                     f"{PEEL_SWELL_OFFSET.get(break_type, 20)} deg up the line so it peels. Heuristic; adjust if you know better.")
+    elif break_type in ("reef", "point"):
         conf *= 0.6
         notes.append(f"{break_type.title()} breaks depend on the seabed, which the coastline doesn't show. "
-                     "Treat the ideal direction as a starting point.")
-    if ideal_i != mid:
+                     "Mark the peel direction (peel_deg or hand) for a better answer.")
+    if ideal_i != want:
         notes.append("Land blocks swell straight onto the shore; ideal moved to the nearest open direction.")
     if moved:
         notes.append(f"Pin moved {round(moved * 1000)} m onto the water.")
@@ -357,6 +392,9 @@ def suggest(lat: float, lon: float, break_type: str = "beach") -> dict:
         "status": "ok",
         "pin": {"lat": round(plat, 5), "lon": round(plon, 5), "moved_m": round(moved * 1000)},
         "facing_deg": round(face),
+        "reef_facing_deg": round(reef_face) if marked else None,
+        "peel_deg": round(peel_deg) if marked else None,
+        "hand": hand if marked else None,
         "swell_dir_ideal": bearings[ideal_i],
         "swell_dir_min": bearings[i0],
         "swell_dir_max": bearings[i1],
