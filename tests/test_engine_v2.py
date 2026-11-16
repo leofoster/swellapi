@@ -159,3 +159,25 @@ def test_v2_scores_peak_period():
     mean_only = hour(swell_direction_deg=180, swell_period_s=10)
     assert infer_spot(long_, SOUTH)["score_period"] > infer_spot(mean_only, SOUTH)["score_period"]
     assert infer_spot(long_, SOUTH, engine="v1")["score_period"] == infer_spot(mean_only, SOUTH, engine="v1")["score_period"]
+
+
+def test_pasted_env_values_are_cleaned(monkeypatch):
+    monkeypatch.setenv("PROXY_TOKEN", " \u201cabc123\u201d\n")
+    monkeypatch.setenv("RELAY_CONFIG_URL", '"https://example.com/relay.json"\n')
+    assert sd._env("PROXY_TOKEN") == "abc123"
+    assert sd._env("RELAY_CONFIG_URL") == "https://example.com/relay.json"
+
+
+def test_broken_relay_header_falls_back_to_direct(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sd, "relay_base", lambda: "https://relay.example")
+    monkeypatch.setattr(sd, "PROXY_TOKEN", "bad\ntoken")
+
+    def fake(url, params, label, headers, timeout):
+        calls.append(url)
+        if "relay" in url:
+            raise ValueError("Invalid header value")       # what requests raises for a newline
+        return {"hourly": {}}
+    monkeypatch.setattr(sd, "_request", fake)
+    assert sd.om_get("marine", {}, "marine") == {"hourly": {}}
+    assert calls[-1] == sd.DIRECT_URLS["marine"]
