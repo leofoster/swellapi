@@ -61,6 +61,9 @@
   .dots i { width: 6px; height: 6px; border-radius: 50%; background: #555; }
   .dots i.on { background: #e0e0e0; width: 9px; height: 9px; }
   .hidden { display: none !important; }
+  .lwframe { width: 100%; max-width: 992px; aspect-ratio: 1240 / 540; border-radius: 10px; overflow: hidden; background: #05080d;
+             box-shadow: 0 0 0 8px #0a0c10, 0 10px 40px rgba(0,0,0,.45); }
+  .lwframe canvas { display: block; width: 100%; height: 100%; }
   .sqframe { width: min(560px, 100%); aspect-ratio: 1; padding: 18px; border-radius: 22px; background: #1b1f24;
              box-shadow: inset 0 0 0 1px #2d333b, 0 14px 40px rgba(0,0,0,.45); cursor: pointer; }
   .sqframe canvas { display: block; width: 100%; height: 100%; border-radius: 6px; background: #0b0f14; }
@@ -90,6 +93,7 @@
   <section class="card device">
     <div class="pcb" id="oledView"><div class="bezel"><canvas id="oled" width="128" height="64"></canvas></div></div>
     <div class="sqframe hidden" id="sqView" title="Click to change page"><canvas id="sq" width="720" height="720"></canvas></div>
+    <div class="lwframe hidden" id="liveView"><canvas id="lwCanvas" width="1240" height="540"></canvas></div>
     <div class="screen hidden" id="mapView">
       <canvas id="mapCanvas"></canvas>
       <div class="hud"><span id="mapTitle">SWELL</span><small id="mapTime"></small></div>
@@ -108,6 +112,7 @@
       <button id="bNext">Next ▶</button>
       <button id="bReset">Reboot</button>
       <button id="bMap">Swell map</button>
+      <button id="bLive">Live wave</button>
     </div>
   </section>
 
@@ -148,6 +153,30 @@
       </div>
     </div>
   </aside>
+
+  <section class="card full hidden" id="lwCard">
+    <h2>Live wave</h2>
+    <div class="tunegrid">
+      <div><label for="lwPreset">Break</label><select id="lwPreset"></select></div>
+      <div><label for="lwLat">Latitude</label><input type="text" id="lwLat"></div>
+      <div><label for="lwLon">Longitude</label><input type="text" id="lwLon"></div>
+      <div><label for="lwBreak">Break type</label><select id="lwBreak"><option>beach</option><option>reef</option><option>point</option><option>rivermouth</option></select></div>
+      <div><label for="lwZoom">Zoom</label><select id="lwZoom"><option>15</option><option selected>16</option><option>17</option></select></div>
+      <div><label for="lwSpeed">Speed</label><select id="lwSpeed"><option value="1">1× (real time)</option><option value="2" selected>2×</option><option value="4">4×</option></select></div>
+      <div><label for="lwApi">Forecast API (any coordinate)</label><input type="text" id="lwApi" spellcheck="false"></div>
+      <div><label>&nbsp;</label><div class="row"><button id="lwReload">Reload</button><label style="display:flex;gap:6px;align-items:center;margin:0"><input type="checkbox" id="lwDebug">coastline</label></div></div>
+    </div>
+    <h2 style="margin-top:14px">Override forecast <input type="checkbox" id="lwOverride" style="vertical-align:middle"></h2>
+    <div class="tunegrid">
+      <div><label for="lwHb">Surf height (m)</label><div class="trow"><input type="range" id="lwHb" min="0.2" max="5" step="0.1" value="1.5"></div></div>
+      <div><label for="lwT">Period (s)</label><div class="trow"><input type="range" id="lwT" min="5" max="20" step="1" value="12"></div></div>
+      <div><label for="lwDir">Swell from (deg)</label><div class="trow"><input type="range" id="lwDir" min="0" max="359" step="1" value="200"></div></div>
+      <div><label for="lwWind">Wind (mph)</label><div class="trow"><input type="range" id="lwWind" min="0" max="30" step="1" value="6"></div></div>
+      <div><label for="lwWindDir">Wind from (deg)</label><div class="trow"><input type="range" id="lwWindDir" min="0" max="359" step="1" value="0"></div></div>
+      <div><label for="lwTide">Tide (0 low, 1 high)</label><div class="trow"><input type="range" id="lwTide" min="0" max="1" step="0.05" value="0.5"></div></div>
+    </div>
+    <p class="hint">Waves come from the forecast at the pin (live API) unless overridden. The engine knobs (slope, peel and foam per break type, shoaling, set length, sea/land darkening) are <code>BREAKS</code> and <code>DEFAULTS</code> in simulator/livewave.js, the same file the web app uses.</p>
+  </section>
 
   <section class="card full hidden" id="tuneCard">
     <h2>Map tuning</h2>
@@ -1063,14 +1092,17 @@ async function loadMap() {
 }
 
 function updateViews() {
-  $("oledView").classList.toggle("hidden", map.on || isSq());
-  $("sqView").classList.toggle("hidden", map.on || !isSq());
+  const big = map.on || lw.on;
+  $("oledView").classList.toggle("hidden", big || isSq());
+  $("sqView").classList.toggle("hidden", big || !isSq());
+  $("liveView").classList.toggle("hidden", !lw.on);
   $("mapView").classList.toggle("hidden", !map.on);
   $("sColorWrap").classList.toggle("hidden", isSq());
 }
 
 async function toggleMap(force) {
   map.on = force ?? !map.on;
+  if (map.on && lw.on) { lw.on = false; cancelAnimationFrame(lw.raf); $("bLive").classList.remove("active"); $("lwCard").classList.add("hidden"); }
   $("bMap").classList.toggle("active", map.on);
   updateViews();
   if (!map.on && isSq()) drawPage();
@@ -1128,6 +1160,134 @@ buildTunePanel();
 $("bMap").onclick = () => toggleMap();
 document.addEventListener("keydown", e => { if (e.key === "m" && !["INPUT", "SELECT"].includes(e.target.tagName)) toggleMap(); });
 setInterval(() => { if (map.on) loadMap().then(redrawMap); }, 15 * 60 * 1000);   // same cadence as the device poll
+
+/* ───────────────────────── Live wave (big-screen POC) ─────────────────────────
+   Thin wrapper around simulator/livewave.js, the framework-free painter the web app
+   copies: buildGeo -> paramsFromHour -> draw. This file only adds the controls,
+   the forecast fetch and the read-out. */
+const LW_W = 1240, LW_H = 540;
+const LW_PRESETS = [   // approximate break positions; type your own lat/lon for anything else
+  ["Southlands, Bermuda", 32.2537, -64.8243, "reef"],
+  ["Pipeline, Oahu", 21.6650, -158.0530, "reef"],
+  ["La Gravière, Hossegor", 43.6730, -1.4450, "beach"],
+  ["Supertubes, J-Bay", -34.0320, 24.9310, "point"],
+  ["Fistral, Newquay", 50.4170, -5.1010, "beach"],
+  ["Uluwatu, Bali", -8.8150, 115.0870, "reef"],
+];
+const LW_COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const lw = { on: false, raf: 0, key: null, geo: null, hour: null, dayHours: null, src: "none", params: null, t: 0, last: 0, M: null, status: "" };
+const lwVal = id => $(id).value;
+async function lwMod() { return lw.M ??= await import(new URL("livewave.js", location.href.replace(/[^/]*$/, "")).href); }
+
+async function lwBuild() {
+  const lat = +lwVal("lwLat"), lon = +lwVal("lwLon"), z = +lwVal("lwZoom"), key = `${lat},${lon},${z}`;
+  if (lw.key === key && lw.geo) return;
+  lw.key = key; lw.geo = null; lw.status = "Loading imagery and coastline…";
+  const M = await lwMod();
+  const geo = await M.buildGeo({ lat, lon, width: LW_W, height: LW_H, opts: { zoom: z } });
+  if (lw.key !== key) return;
+  lw.geo = geo; lw.params = null;
+  lw.status = geo.status === "synthetic" ? "No coastline found here: showing a generic beach" : "";
+  serial(`[live] ${geo.shores.length} shoreline runs (${geo.status}), ${geo.mpp.toFixed(2)} m/px`);
+}
+
+async function lwForecast() {
+  const lat = +lwVal("lwLat"), lon = +lwVal("lwLon"), api = lwVal("lwApi").trim().replace(/\/+$/, "");
+  lw.hour = null; lw.params = null;
+  try {
+    const r = await fetch(`${api}/forecast`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ spot_name: "Live", lat, lon, swell_dir_min: 0, swell_dir_max: 359, swell_dir_ideal: 180,
+                             wind_offshore_min: 0, wind_offshore_max: 90, break_type: lwVal("lwBreak"), days: 2, timezone: "auto" }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : `HTTP ${r.status}`);
+    const now = Date.now() / 1000, all = d.days.flatMap(x => x.hours);
+    lw.hour = all.find(x => Date.parse(x.time) / 1000 + 3600 > now) || all[0];
+    lw.dayHours = all.slice(0, 26); lw.src = "api";
+  } catch (e) {
+    serial(`[live] forecast API unavailable (${e.message}); using device data`);
+    const b = dev?.blocks?.find(x => blockVisible(x, nowUnix()));
+    if (b) { lw.hour = { surf_height_m: b.surfHeight ?? b.swellHeight, swell_period_s: b.swellPeriod, swell_direction_deg: b.swellDeg,
+                         wind_speed_mph: b.windSpeed, wind_direction_deg: b.windDeg, daylight: b.daylight }; lw.src = "device"; }
+    else lw.src = "none";
+  }
+}
+
+function lwCurrentParams() {
+  const M = lw.M, geo = lw.geo;
+  if (!M || !geo) return null;
+  const manual = $("lwOverride").checked;
+  const sig = manual ? ["lwHb", "lwT", "lwDir", "lwWind", "lwWindDir", "lwTide"].map(lwVal).join() : lw.hour;
+  if (lw.params && lw.params._sig === sig && lw.params._brk === lwVal("lwBreak")) return lw.params;
+  const hour = manual ? { surf_height_m: +lwVal("lwHb"), swell_period_s: +lwVal("lwT"), swell_direction_deg: +lwVal("lwDir"),
+                          wind_speed_mph: +lwVal("lwWind"), wind_direction_deg: +lwVal("lwWindDir"), tide_level: +lwVal("lwTide") }
+                      : (lw.hour || {});
+  const p = M.paramsFromHour(hour, { break_type: lwVal("lwBreak") }, geo, manual ? null : lw.dayHours);
+  p._sig = sig; p._brk = lwVal("lwBreak"); p._src = manual ? "manual" : lw.src; p._hour = hour;
+  return lw.params = p;
+}
+
+function lwFrame(ts) {
+  if (!lw.on) return;
+  const c = $("lwCanvas"), ctx = c.getContext("2d");
+  const dt = Math.min(0.05, (ts - (lw.last || ts)) / 1000); lw.last = ts;
+  lw.t += dt * +lwVal("lwSpeed");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const p = lwCurrentParams();
+  const t0 = performance.now();
+  if (p) lw.M.draw(ctx, LW_W, LW_H, lw.geo, p, lw.t);
+  else { ctx.fillStyle = "#05080d"; ctx.fillRect(0, 0, LW_W, LW_H); }
+  lw.drawMs = lw.drawMs == null ? 0 : lw.drawMs * 0.95 + (performance.now() - t0) * 0.05;
+
+  if ($("lwDebug").checked && lw.geo) for (const s of lw.geo.shores) {
+    ctx.strokeStyle = "#ff3b8d"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(s.xs[0], s.ys[0]);
+    for (let i = 1; i < s.n; i++) ctx.lineTo(s.xs[i], s.ys[i]); ctx.stroke();
+    ctx.strokeStyle = "#ffd23f"; ctx.lineWidth = 1;
+    for (let i = 0; i < s.n; i += 12) { ctx.beginPath(); ctx.moveTo(s.xs[i], s.ys[i]); ctx.lineTo(s.xs[i] + s.nx[2][i] * 18, s.ys[i] + s.ny[2][i] * 18); ctx.stroke(); }
+  }
+  // read-out (the app draws its own; this mirrors it)
+  ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(0, 0, LW_W, 64); ctx.fillRect(0, LW_H - 30, LW_W, 30);
+  txt(ctx, $("lwPreset").selectedOptions[0]?.textContent || "Pin", 24, 40, 26, "#e6edf3", 700);
+  const comp = d => d == null ? "" : LW_COMPASS[Math.round(d / 22.5) % 16];
+  let info = lw.status || "Loading…";
+  if (p && !lw.status) {
+    const src = { manual: "Manual", api: "Live", device: "Device data", none: "No forecast" }[p._src];
+    info = `${src} · surf ~${p.hb.toFixed(1)} m · ${Math.round(p.T)} s ${comp(p.dir)}`
+      + (p.h2 > 0.2 ? ` + ${p.h2.toFixed(1)} m ${Math.round(p.T2)} s ${comp(p.dir2)}` : "")
+      + ` · wind ${Math.round(p.windMph)} mph ${p.wind || ""} · tide ${p.tideM >= 0 ? "+" : ""}${p.tideM.toFixed(2)} m`
+      + (p.blocked ? " · swell blocked here" : "");
+  }
+  txt(ctx, info, LW_W - 24, 40, 17, lw.status ? "#d29922" : "#c9d1d9", 500, "right");
+  txt(ctx, `${lw.M ? lw.M.ATTRIBUTION : ""} · ${lw.M ? lw.M.CAPTION : ""}`, LW_W - 16, LW_H - 10, 12, "#8b949e", 400, "right");
+  if ($("lwDebug").checked) txt(ctx, `draw ${lw.drawMs.toFixed(2)} ms`, 16, LW_H - 10, 12, "#ffd23f", 600);
+  lw.raf = requestAnimationFrame(lwFrame);
+}
+
+async function toggleLive(force) {
+  lw.on = force ?? !lw.on;
+  if (lw.on && map.on) { map.on = false; clearTimeout(map.timer); $("bMap").classList.remove("active"); $("tuneCard").classList.add("hidden"); }
+  $("bLive").classList.toggle("active", lw.on);
+  $("lwCard").classList.toggle("hidden", !lw.on);
+  updateViews();
+  cancelAnimationFrame(lw.raf);
+  if (!lw.on) { if (isSq()) drawPage(); return; }
+  lw.last = 0; lw.raf = requestAnimationFrame(lwFrame);
+  await Promise.all([lwBuild(), lw.hour ? null : lwForecast()]);
+}
+function lwInit() {
+  $("lwPreset").innerHTML = LW_PRESETS.map(([n], i) => `<option value="${i}">${n}</option>`).join("") + `<option value="custom">Custom pin</option>`;
+  const reload = () => { if (!lw.on) return; lwBuild(); lwForecast(); };
+  $("lwPreset").onchange = () => { const p = LW_PRESETS[+lwVal("lwPreset")]; if (!p) return;
+    $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3]; reload(); };
+  for (const id of ["lwLat", "lwLon"]) $(id).onchange = () => { $("lwPreset").value = "custom"; reload(); };
+  $("lwZoom").onchange = () => lw.on && lwBuild();
+  $("lwApi").onchange = () => lw.on && lwForecast();
+  $("lwReload").onclick = () => { lw.key = null; reload(); };
+  $("lwApi").value = location.hostname === "localhost" ? "http://localhost:8000" : "https://swellapi-1.onrender.com";
+  const p = LW_PRESETS[0]; $("lwLat").value = p[1]; $("lwLon").value = p[2]; $("lwBreak").value = p[3];
+  $("bLive").onclick = () => toggleLive();
+  document.addEventListener("keydown", e => { if (e.key === "l" && !["INPUT", "SELECT"].includes(e.target.tagName)) toggleLive(); });
+}
+lwInit();
 
 restore();
 let last = performance.now();
