@@ -107,6 +107,90 @@ otherwise mean x 1.35. Checked against 8 NOAA buoys on 2026-11-16: mean absolute
 buoy peak period 3.3 s -> 1.9 s overall, about 3.9 s -> 1.2 s at groundswell buoys. Buoys
 dominated by local wind chop (dominant period under 9 s) don't compare like for like.
 
+## Suggest a spot's directions: GET /spot/suggest
+
+`GET /spot/suggest?lat=&lon=&break_type=beach|reef|point|rivermouth`
+
+Works out the swell window and offshore wind from the coastline (OpenStreetMap ocean polygons
+via OpenFreeMap; credit `attribution`). Use it for a "Calculate" button when creating a break,
+then let the user edit the values.
+
+- **Returns** `swell_dir_min`, `swell_dir_max`, `swell_dir_ideal`, `shadow_zones`,
+  `wind_offshore_min`, `wind_offshore_max`: these drop straight into `POST /forecast`.
+- **Also** `facing_deg` (the way the shore faces), `confidence` (0-1), `notes`, `pin` (where it
+  measured; a pin on the sand is moved up to 1 km onto the water) and `fetch_km` (open water per
+  bearing, for drawing the window).
+- **`status`**: `ok`, `inland` (no sea within 1 km), `open-water` (no coast within 1 km) or
+  `enclosed` (every seaward direction meets land). Only `ok` has direction fields.
+- **503** if the map tiles can't be reached. Takes about 0.5-2 s; tiles are cached for a day.
+- **How it works:** facing = mean direction of water on rings out to 3 km; a ray every 5° across
+  the seaward half measures open water to 150 km; bearings with too little open water are outside
+  the window, or shadow zones if inside it; offshore wind = facing + 180 ± 45.
+- **Reefs and points: mark the peel.** Put the pin on the peak and add `peel_deg` (the compass
+  bearing the wave peels toward, e.g. from a drag on the map) or `hand=left|right`. The reef is
+  taken to run along the peel line, and the ideal swell is set round from up the line (20° for
+  reefs, 45° for points) so the wave peels. Returns `reef_facing_deg`, `peel_deg`, `hand`.
+  On 8 known reefs and points this cut the average ideal-direction error from ~60° to ~35°
+  (rough reference values; unverified).
+- **Accuracy (42 test breaks, compared with approximate known facings, unverified):** beaches
+  usually within ~20°; reefs and points often 30-130° off, because their best swell depends on
+  the seabed, not the shoreline. Reef and point results carry lower `confidence` and a note.
+## Surf height: angle loss, range and calibration
+
+- **Angle loss (beach, rivermouth):** a swell arriving at angle θ to the beach normal spreads
+  along the shore, so its height is scaled by `sqrt(cos θ)`. The beach normal is taken to be
+  `swell_dir_ideal`, so **set `swell_dir_ideal` to the direction the beach faces**. Points and
+  reefs are unchanged (they wrap and focus swell).
+- **Range:** `surf_min_m` and `surf_max_m` (0.7× and 1.0× of `surf_height_m`). Show
+  "2-3 ft" from these rather than a single number.
+- **`height_scale`** (request, default 1.0, max 3): per-spot calibration. If a spot reliably reads
+  20% high, send 0.8.
+- **Unverified:** the 0.7-1.0 range and the angle loss are calibrated against one beach
+  observation (La Cícer, 2026-11-16), not a dataset.
+
+## Session reports: POST /spot/calibrate
+
+Surfers log what it was actually like; the API turns a spot's reports into a better
+`height_scale` and `swell_dir_ideal`. **The API stores nothing**: the app keeps the reports and
+sends them all (up to 500) when it wants a recalibration. No Open-Meteo calls.
+
+Each report (all fields optional; send what you have):
+
+| Field | What |
+|---|---|
+| `time` | When (ISO) |
+| `observed_surf_ft` or `observed_surf_m` | Height of the sets, as the surfer judged it |
+| `rating` | 1-5, how good it was |
+| `forecast_surf_m` | `surf_height_m` the app showed for that hour (**save it with the report**) |
+| `forecast_score` | `score_overall` shown for that hour |
+| `swell_direction_deg` | `swell_direction_deg` shown for that hour |
+| `height_scale_used` | The spot's `height_scale` at the time |
+
+Request: `{"reports": [...], "height_scale": <current>, "swell_dir_ideal": <current>}`.
+
+Response: `height_scale` and `swell_dir_ideal` to save back to the spot, `height_reports_used`,
+`direction_reports_used`, `confidence` (0-1), `observed_to_forecast_iqr` (spread, 4+ reports),
+`score_bias` (forecast score minus rating on a 0-1 scale; information only) and `notes`.
+
+How: each report implies a scale (`used × observed / forecast`); the median moves the current
+value by `n / (n + 3)`, so one odd report can't swing it. A new ideal direction needs 3+ sessions
+rated 4-5. Flat days (observed 0) are ignored for height.
+
+## Buoys: positions and raw readings
+
+Source: NOAA NDBC realtime feeds. Coverage is mostly US waters plus some partner buoys;
+elsewhere the list is empty (not an error).
+
+- `GET /buoys/near?lat=&lon=&max_km=300&k=5&hours=0`: nearest buoys, each with `id`, `name`,
+  `owner`, exact `lat`/`lon`, `distance_km`, `bearing_deg` (from the spot), `observed_at`,
+  `latest` (newest non-null value of every field) and `available`. `hours>0` adds `met` and
+  `spectral` history.
+- `GET /buoys/{id}?hours=24`: one buoy with position, `latest`, `met` (wind, waves, pressure,
+  temperatures) and `spectral` (the buoy's own swell vs wind-wave split: `swell_height_m`,
+  `swell_period_s`, `swell_dir`, `wind_wave_*`, `steepness`). 404 for an unknown id.
+- `units` maps every field to its unit. Missing readings are `null`.
+- `POST /forecast` `buoy` (when a buoy corrected the forecast) now includes `name`, `lat`, `lon`.
+
 ## Device payload
 
 `POST /esp?blocks=8` takes the same body as `/forecast` and returns the compact

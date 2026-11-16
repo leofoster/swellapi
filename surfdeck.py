@@ -107,7 +107,8 @@ class SpotConfig:
     exposure: float = 1.0
     shadow_zones: list = field(default_factory=list)
     wrap_factor: float = 0.0
-    
+    height_scale: float = 1.0   # per-spot calibration of surf height (e.g. 0.8 if it reads high)
+
     # ── New Tide Preferences ───────────────────────────────────────
     tide_level_ideal: Optional[str] = None      # "low", "low-mid", "mid", "mid-high", "high"
     tide_movement_ideal: Optional[str] = None   # "rising", "falling"
@@ -428,24 +429,25 @@ def tides_from_sea_level(rows: list, tz) -> Optional[dict]:
 
 
 def nearest_buoys(lat: float, lon: float, max_km: float = 200.0, k: int = 3, timeout: float = 3.0) -> list[dict]:
-    """Up to k closest active NDBC moored buoys within max_km, nearest first. List cached 24h."""
+    """Up to k closest active NDBC moored buoys within max_km, nearest first, with id, name, owner,
+    lat, lon and distance_km. Station list cached 24h."""
     now = time.monotonic()
     if now - _stations["t"] > 86400:
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(_session.get("https://www.ndbc.noaa.gov/activestations.xml", timeout=timeout).content)
             # moored buoys only: coastal "fixed" stations mostly measure tides/met, not waves
-            _stations["list"] = [(st.get("id"), float(st.get("lat")), float(st.get("lon")))
+            _stations["list"] = [{"id": st.get("id"), "name": st.get("name"), "owner": st.get("owner"),
+                                  "lat": float(st.get("lat")), "lon": float(st.get("lon"))}
                                  for st in root.iter("station") if st.get("type") == "buoy"]
             _stations["t"] = now
         except Exception:
             _stations["t"] = now - 86400 + 600                         # retry in 10 min
     near = []
-    for sid, la, lo in _stations["list"]:
-        d = 6371 * 2 * math.asin(math.sqrt(math.sin(math.radians(la - lat) / 2) ** 2 + math.cos(math.radians(lat))
-                                 * math.cos(math.radians(la)) * math.sin(math.radians(lo - lon) / 2) ** 2))
+    for st in _stations["list"]:
+        d = haversine_km(lat, lon, st["lat"], st["lon"])
         if d <= max_km:
-            near.append({"id": sid, "distance_km": round(d)})
+            near.append({**st, "distance_km": round(d)})
     return sorted(near, key=lambda b: b["distance_km"])[:k]
 
 
@@ -496,7 +498,8 @@ def _buoy_correction(rows, lat, lon, now, horizon_h):
             if r.get(key) is not None:
                 r[key] = r[key] * k
         out.append(r)
-    info = {"station": st["id"], "distance_km": st["distance_km"], "observed_wave_m": obs["wave_height_m"],
+    info = {"station": st["id"], "name": st.get("name"), "lat": st.get("lat"), "lon": st.get("lon"),
+            "distance_km": st["distance_km"], "observed_wave_m": obs["wave_height_m"],
             "model_wave_m": round(model, 2), "ratio": round(ratio, 2), "observed_at": obs.get("timestamp"),
             "summary": summarise_buoys([obs])}
     return out, info
@@ -790,6 +793,8 @@ GLASSY_MPH = 5.0        # at or below this, wind direction barely matters
 GLASSY_BLEND_MPH = 5.0  # blend from glassy to normal scoring over the next 5 mph
 GUSTY_DELTA_MPH = 10.0  # gusts this far above the mean wind cost 0.1
 REF_PERIOD_S = 12.0    # peak-period reference (was 10 s with mean periods; same calibration)
+OBLIQUE_BREAKS = ("beach", "rivermouth")   # straight-ish shores: angled swell spreads out and loses height
+SURF_RANGE = (0.7, 1.0)  # surf range as fractions of the breaking height (unvalidated: one beach observation)
 DIR_FALLOFF = 2.0       # direction factor reaches 0 at 90/DIR_FALLOFF = 45 deg outside the window
 ENGINE_WEIGHTS = {
     "beach": {"dir": 0.30, "period": 0.25, "height": 0.25, "wind": 0.20},
@@ -840,8 +845,13 @@ def swell_component(h: float, p: float, d: float, spot: SpotConfig) -> dict:
             factor = math.cos(math.radians(min(90.0, out * DIR_FALLOFF))) ** 2
             s_dir = 0.3 * factor
     h_arr = h * spot.exposure * factor                       # what arrives, deep-water terms
+    if spot.break_type in OBLIQUE_BREAKS:
+        # refraction: a swell arriving at angle θ to the beach normal (≈ swell_dir_ideal) spreads its
+        # energy along the shore, so height scales ~ sqrt(cos θ) (linear refraction, energy-flux balance)
+        theta = min(ang_diff(d, spot.swell_dir_ideal), 85.0)
+        h_arr *= math.sqrt(math.cos(math.radians(theta)))
     h_eq = h_arr * (max(p, 1.0) / REF_PERIOD_S) ** 0.4        # period-aware equivalent height
-    return {"h_eq": h_eq, "hb": breaking_height(h_arr, p), "s_dir": s_dir,
+    return {"h_eq": h_eq, "hb": breaking_height(h_arr, p) * spot.height_scale, "s_dir": s_dir,
             "s_period": score_period(p, spot.swell_period_min, spot.swell_period_ideal),
             "in_shadow": in_shadow and not is_wrap, "is_wrap": is_wrap, "dir": d, "period": p}
 
@@ -889,6 +899,7 @@ def infer_spot_v2(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
     wts = [e / total for e in energy] if total > 0 else [1 / len(trains)] * len(trains)
     dom = trains[max(range(len(trains)), key=lambda i: energy[i])]
     h_eq = math.sqrt(total)
+    hb = math.sqrt(sum(t["hb"] ** 2 for t in trains))
 
     s_dir    = sum(w * t["s_dir"] for w, t in zip(wts, trains))
     s_period = sum(w * t["s_period"] for w, t in zip(wts, trains))
@@ -907,7 +918,9 @@ def infer_spot_v2(hour: dict, spot: SpotConfig, tide_hour: dict = None) -> dict:
     return {
         "spot": spot.name, "shore": spot.shore,
         "effective_height_m": round(h_eq, 2),
-        "surf_height_m":      round(math.sqrt(sum(t["hb"] ** 2 for t in trains)), 2),
+        "surf_height_m":      round(hb, 2),
+        "surf_min_m":         round(hb * SURF_RANGE[0], 2),
+        "surf_max_m":         round(hb * SURF_RANGE[1], 2),
         "is_wrap_event":      dom["is_wrap"],
         "in_shadow":          dom["in_shadow"],
         "dominant_swell_dir": dom["dir"],
