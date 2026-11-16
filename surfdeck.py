@@ -35,10 +35,15 @@ import statistics
 #                     (and its tunnel URL can change) without touching Render.
 #   PROXY_TOKEN       shared secret the relay requires (X-Proxy-Token)
 # If the relay fails, requests fall back to calling Open-Meteo directly.
-OPEN_METEO_PROXY   = os.environ.get("OPEN_METEO_PROXY", "").rstrip("/")
-RELAY_CONFIG_URL   = os.environ.get("RELAY_CONFIG_URL", "")
+def _env(name: str) -> str:
+    """Env var with pasting accidents removed: whitespace, newlines, straight or curly quotes."""
+    return os.environ.get(name, "").strip().strip("\"'\u201c\u201d\u2018\u2019").strip()
+
+
+OPEN_METEO_PROXY   = _env("OPEN_METEO_PROXY").rstrip("/")
+RELAY_CONFIG_URL   = _env("RELAY_CONFIG_URL")
 RELAY_CONFIG_TTL   = float(os.environ.get("RELAY_CONFIG_TTL", "60"))
-PROXY_TOKEN        = os.environ.get("PROXY_TOKEN", "")
+PROXY_TOKEN        = _env("PROXY_TOKEN")
 OPEN_METEO_TIMEOUT = float(os.environ.get("OPEN_METEO_TIMEOUT", "20"))
 # Open-Meteo refreshes hourly, so re-asking more often only burns the quota.
 OPEN_METEO_CACHE_TTL = float(os.environ.get("OPEN_METEO_CACHE_TTL", "1800"))
@@ -226,8 +231,8 @@ def om_get(kind: str, params: dict, label: str, timeout: Optional[float] = None)
             headers["X-Proxy-Token"] = PROXY_TOKEN
         try:
             return _request(base + RELAY_PATHS[kind], params, f"{label} (relay)", headers, timeout)
-        except UpstreamError as e:
-            print(f"  relay failed, going direct: {e}")
+        except Exception as e:                # anything wrong with the relay (or its settings): go direct
+            print(f"  relay failed, going direct: {type(e).__name__}: {e}")
     return _request(DIRECT_URLS[kind], params, label, {}, timeout)
 
 
