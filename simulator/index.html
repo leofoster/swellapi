@@ -57,6 +57,12 @@
   .screen { background: #0d1117; }
   .ramp { width: 120px; height: 8px; border-radius: 4px; flex: none; }
   .screen .foot span { white-space: nowrap; }
+  .satgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 10px; }
+  .satgrid figure { margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .satgrid img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: #0a0c10; cursor: zoom-in; }
+  .satgrid figcaption { padding: 8px 10px; font-size: 12px; line-height: 1.5; }
+  .satgrid figcaption b { font-size: 13px; }
+  .satgrid figcaption span { color: var(--muted); }
   .dots { margin-left: auto; display: flex; gap: 5px; align-items: center; }
   .dots i { width: 6px; height: 6px; border-radius: 50%; background: #555; }
   .dots i.on { background: #e0e0e0; width: 9px; height: 9px; }
@@ -189,6 +195,18 @@
     </div>
     <p class="hint">Pick a break, step through them with ◀ ▶ (or <kbd>[</kbd> <kbd>]</kbd>), or type any latitude/longitude and press Enter. The address bar link (<code>#live=lat,lon,type</code>) reopens that exact pin. Preset positions are approximate.
     Waves come from the forecast at the pin (live API) unless overridden. The engine knobs (slope, peel and foam per break type, shoaling, set length, sea/land darkening) are <code>BREAKS</code> and <code>DEFAULTS</code> in simulator/livewave.js, the same file the web app uses.</p>
+  </section>
+
+  <section class="card full hidden" id="satCard">
+    <h2>Satellite history <span class="hint" style="text-transform:none;letter-spacing:0;font-weight:400">uses the break, pin and API above</span></h2>
+    <div class="tunegrid">
+      <div><label for="satDays">Look back</label><select id="satDays"><option value="30">30 days</option><option value="60" selected>60 days</option><option value="92">92 days</option></select></div>
+      <div><label for="satCloud">Max cloud at spot</label><select id="satCloud"><option>10</option><option selected>20</option><option>40</option><option>100</option></select></div>
+      <div><label for="satSize">Crop width</label><select id="satSize"><option value="1200">1.2 km</option><option value="2400" selected>2.4 km</option><option value="4800">4.8 km</option></select></div>
+      <div><label>&nbsp;</label><div class="row"><button id="satLoad">Load passes</button></div></div>
+    </div>
+    <p class="hint" id="satStatus">Sentinel-2, 10 m pixels, about 11:00-12:00 UTC. First load takes ~10 s (cloud check per pass); each image ~4 s.</p>
+    <div id="satGrid" class="satgrid"></div>
   </section>
 
   <section class="card full hidden" id="tuneCard">
@@ -1195,7 +1213,7 @@ const LW_PRESETS = [
     ["Puerto Escondido, Mexico", 15.8600, -97.0700, "beach"]]],
   ["Caribbean & Atlantic islands", [
     ["Southlands, Bermuda", 32.2537, -64.8243, "reef"], ["Tres Palmas, Puerto Rico", 18.3530, -67.2610, "reef"],
-    ["Soup Bowl, Barbados", 13.2190, -59.5220, "reef"]]],
+    ["Soup Bowl, Barbados", 13.2190, -59.5220, "reef"], ["La Cícer, Gran Canaria", 28.1295, -15.4485, "beach"]]],
   ["Europe", [
     ["Nazaré, Portugal", 39.6050, -9.0870, "beach"], ["Supertubos, Peniche", 39.3460, -9.3630, "beach"],
     ["La Gravière, Hossegor", 43.6730, -1.4450, "beach"], ["Mundaka, Spain", 43.4080, -2.6970, "rivermouth"],
@@ -1363,6 +1381,38 @@ function lwInit() {
   document.addEventListener("keydown", e => { if (e.key === "l" && !["INPUT", "SELECT"].includes(e.target.tagName)) toggleLive(); });
 }
 lwInit();
+
+/* ───────────────────────── Satellite history (GET /spot/history) ───────────────────────── */
+async function satLoad() {
+  const api = lwVal("lwApi").replace(/\/$/, ""), lat = +lwVal("lwLat"), lon = +lwVal("lwLon");
+  const q = new URLSearchParams({ lat, lon, days: lwVal("satDays"), max_cloud: lwVal("satCloud"), size_m: lwVal("satSize"), limit: 24 });
+  $("satStatus").textContent = `Searching passes over ${lat.toFixed(4)}, ${lon.toFixed(4)}…`; $("satGrid").innerHTML = "";
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`${api}/spot/history?${q}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    const ft = m => m == null ? "?" : (m * 3.28).toFixed(1);
+    $("satStatus").textContent = `${d.count} clear of ${d.passes_found} passes in ${d.days} days · ${((performance.now() - t0) / 1000).toFixed(1)} s`
+      + (d.notes.length ? " · " + d.notes.join(" ") : "") + ` · ${d.attribution}`;
+    $("satGrid").innerHTML = d.passes.map(p => {
+      const c = p.conditions || {}, when = new Date(p.time);
+      const img = api + p.image_path;
+      return `<figure><a href="${img}&px=1024" target="_blank" rel="noopener"><img loading="lazy" src="${img}" alt="Sentinel-2 ${p.time}"></a>
+        <figcaption><b>${when.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</b>
+        <span>${when.toISOString().slice(11, 16)} UTC · cloud ${p.spot_cloud_pct}%</span><br>`
+        + (p.conditions ? `Swell ${ft(c.swell_height_m)} ft @ ${c.swell_period_s ?? "?"} s ${c.swell_direction || ""} (${c.swell_direction_deg ?? "?"}°)<br>
+        Wind ${Math.round(c.wind_speed_mph ?? 0)} mph ${c.wind_direction || ""} · gust ${Math.round(c.wind_gusts_mph ?? 0)}<br>
+        Tide ${c.tide_status || "?"} · level ${c.tide_level ?? "?"} · ${c.tide_height_m ?? "?"} m` : `<span>No conditions</span>`)
+        + `</figcaption></figure>`;
+    }).join("");
+  } catch (e) {
+    $("satStatus").textContent = `Failed: ${e.message}. Is the API at ${api} running this branch?`;
+  }
+}
+$("satLoad").onclick = satLoad;
+new MutationObserver(() => $("satCard").classList.toggle("hidden", $("lwCard").classList.contains("hidden")))
+  .observe($("lwCard"), { attributes: true, attributeFilter: ["class"] });
 
 restore();
 let last = performance.now();
